@@ -86,3 +86,41 @@ class PreparedJob(BaseModel):
     contact_sheet_path: Path
     prep_cost_usd: float = 0.0
     timings_sec: dict[str, float] = Field(default_factory=dict)
+
+
+class GPUInstanceState(BaseModel):
+    """Persisted metadata for an active rented GPUniq instance."""
+
+    task_id: int
+    agent_id: int
+    gpu_model: str
+    price_per_hour: float
+    ssh_host: str
+    ssh_port: int
+    ssh_user: str = "root"
+    ssh_key_path: Path
+    status: str = "running"
+    created_at: str
+
+
+class RenderResult(BaseModel):
+    """Measured output and cost telemetry for one remote GPU render."""
+
+    job_id: str
+    mode: RemakeMode
+    tier: RenderTier
+    width: int
+    height: int
+    num_frames: int
+    seed: int = 0
+    attn_backend: str = "_native_cudnn"
+    wall_sec: float
+    render_sec: float
+    peak_alloc_gib: float = 0.0
+    peak_reserved_gib: float = 0.0
+    gpu_model: str
+    gpu_price_per_hour: float
+    render_cost_usd: float
+    inference_only_cost_usd: float = 0.0
+    out_video_path: Path
+    has_audio: bool = False

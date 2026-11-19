@@ -278,6 +278,42 @@
       font-size: 8pt;
     }
 
+    .strip-card {
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #f8fafc;
+      margin: 6px 0 8px 0;
+      break-inside: avoid;
+    }
+
+    .strip-card img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .strip-caption {
+      padding: 4px 8px;
+      font-size: 8.2pt;
+      font-weight: 600;
+      color: #1e293b;
+      border-top: 1px solid #cbd5e1;
+      background: #ffffff;
+    }
+
+    .callout-info {
+      border: 1px solid #bfdbfe;
+      border-left: 3px solid #2563eb;
+      background: #eff6ff;
+      border-radius: 5px;
+      padding: 7px 10px;
+      font-size: 8.7pt;
+      color: #1e3a8a;
+      margin-bottom: 8px;
+      break-inside: avoid;
+    }
+
     .footer {
       margin-top: 12px;
       padding-top: 6px;
@@ -298,13 +334,13 @@
       </div>
     </div>
     <div class="meta-badges">
-      <div class="badge">Шаги 0–1 завершены</div>
+      <div class="badge">Шаги 0–2 завершены</div>
       <div>Обновлено: 2026-11-19</div>
       <div>Репозиторий: <code>kilebles/loki-prj</code></div>
     </div>
   </div>
 
-  <h2>1. Схема пайплайна (что работает сейчас и что подключается на Шаге 2)</h2>
+  <h2>1. Схема пайплайна (сквозной цикл от исходника до MP4)</h2>
   <div class="pipeline-flow">
     <div class="flow-node">
       <div class="flow-num">Шаг 1</div>
@@ -331,8 +367,8 @@
       <div class="flow-title">Манифест</div>
       <div class="flow-sub"><code>job.json</code> · чек-метрики</div>
     </div>
-    <div class="flow-node gpu-next">
-      <div class="flow-num">Далее (Этап 2)</div>
+    <div class="flow-node">
+      <div class="flow-num">Шаг 6 (H200)</div>
       <div class="flow-title">GPU-рендер</div>
       <div class="flow-sub"><code>MiniMax-H3</code> + Viggle LoRA</div>
     </div>
@@ -408,12 +444,12 @@
   </div>
 
   <div class="next-box">
-    <div class="next-title">Что происходит дальше — Шаг 2 (GPU-рендер на GPUniq)</div>
+    <div class="next-title">6. GPU-рендер на GPUniq — <code>gpuniq/ops.py</code> + <code>engine/viggle_bf16.py</code> (проверено на H200)</div>
     <p>
-      Готовый комплект (<code>cond.mp4</code> + <code>audio.m4a</code> + <code>ref_1.png</code> с <code>--pin 76</code> +
-      <code>prompt.txt</code>) передаётся в воркер <code>MiniMax-H3 + Viggle LoRA</code> на карте <code>H200 (141 GB)</code> или
-      <code>RTX PRO 6000 (96 GB)</code>. За 6 шагов модель рендерит итоговый <code>.mp4</code> со звуком и при необходимости
-      прогоняет быстрый апскейл <code>480p → 720p</code>.
+      Команды <code>loki-remake gpu-up</code>, <code>gpu-setup</code> и <code>gpu-render</code> автоматически арендуют
+      <code>H200 140GB</code> с поминутным биллингом, ставят окружение и веса (~4 мин), загружают <code>job_dir</code> на GPU,
+      рендерят <code>out_480.mp4</code> / <code>out_736.mp4</code> через <code>sample.py</code> с <code>_native_cudnn</code> и
+      сразу удаляют инстанс по <code>gpu-down</code>.
     </p>
   </div>
 
@@ -461,13 +497,13 @@
       </tr>
       <tr>
         <td>Качество кода и автотесты</td>
-        <td><code>ruff</code> 0 ошибок · <code>pytest</code> <strong>12/12 passed</strong></td>
-        <td>Покрытие: нормализация, сцены, валидатор промпта, mock GPUniq + fallback</td>
+        <td><code>ruff</code> 0 ошибок · <code>pytest</code> <strong>16/16 passed</strong></td>
+        <td>Покрытие: нормализация, сцены, валидатор, движок <code>sample.py</code>, mock GPUniq + SSH</td>
       </tr>
       <tr>
-        <td>Баланс аккаунта GPUniq после тестов</td>
-        <td><strong>$112.0142</strong> (свободно)</td>
-        <td>Доступно 12× <code>H200</code> ($5.81/ч) и 11× <code>RTX PRO 6000 S</code> ($2.73/ч)</td>
+        <td>Баланс аккаунта GPUniq после Шага 2</td>
+        <td><strong>$110.5270</strong> (свободно)</td>
+        <td>Потрачено на весь Шаг 2: <strong>$1.4872</strong> (активных инстансов: <code>0</code>)</td>
       </tr>
     </tbody>
   </table>
@@ -494,13 +530,13 @@
       </tr>
       <tr>
         <td><strong>Шаг 2</strong> — GPU-стенд на GPUniq</td>
-        <td><span class="status-pending">Ожидает роликов Насти</span></td>
-        <td>Разворачивание <code>H200</code> (<code>bf16</code>), тест <code>sample.py</code> + проверка <code>_native_cudnn</code></td>
+        <td><span class="status-done">Готово · H200 OK</span></td>
+        <td>Провижининг, <code>setup_gpu.sh</code> (4 мин 12 с), замеры <code>480p</code> (95.7s) vs <code>736p</code> (368.0s), автоудаление</td>
       </tr>
       <tr>
-        <td><strong>Шаг 3</strong> — Прогон кейсов и замер экономики</td>
-        <td><span class="status-pending">План</span></td>
-        <td>Тест 5–7 роликов в нативном <code>720p</code> vs <code>480p + апскейл</code>, тест <code>Q8_0</code> на <code>RTX PRO 6000</code></td>
+        <td><strong>Шаг 3</strong> — Прогон кейсов Насти + апскейл</td>
+        <td><span class="status-pending">Ожидает роликов Насти</span></td>
+        <td>Тест 5–7 реальных роликов (<code>swap</code>/<code>edit</code>), подключение апскейла <code>480→720</code> и проверка <code>Q8_0</code> на PRO 6000</td>
       </tr>
       <tr>
         <td><strong>Шаг 4</strong> — Сдача PoC и переход в прод</td>
@@ -509,6 +545,57 @@
       </tr>
     </tbody>
   </table>
+
+  <h2 class="page-break">5. Результаты GPU-стенда на H200 (Шаг 2)</h2>
+  <p>
+    Развёрнут боевой инстанс <code>1× NVIDIA H200 (139.8 GiB VRAM, 251 GiB RAM)</code> на GPUniq Marketplace
+    (<code>$5.577/ч</code> с поминутным биллингом). Установка окружения (<code>torch 2.9.1 + cu128</code>,
+    <code>diffusers@d6726f3</code>) и скачивание ~144 GB весов <code>MiniMax-H3 + Viggle-Remake</code> заняли
+    <strong>4 мин 12 сек</strong>; оба прогона (<code>480p</code> и <code>736p</code>) отработали чисто с сохранением звука,
+    после чего инстанс сразу удалён (<code>Active instances: 0</code>).
+  </p>
+
+  <div class="strip-card">
+    <img src="assets/smoke_render_strip.jpg" alt="Раскадровка итогового рендера out_480.mp4" />
+    <div class="strip-caption">
+      Готовый рендер <code>out_480.mp4</code> (0.50s · 3.17s · 8.33s): красная кожаная куртка стабильно держится на всей длине ролика
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Режим / Канвас</th>
+        <th>Чистый инференс</th>
+        <th>Wall (с загрузкой весов)</th>
+        <th>Пик VRAM (alloc / res)</th>
+        <th>Цена генерации (инф. / wall)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>480p bf16</strong> (<code>832×480</code>, 226 к.)</td>
+        <td><strong>95.7 сек</strong> (~12.3 с/шаг)</td>
+        <td>154.5 сек</td>
+        <td>87.0 / 96.1 GiB</td>
+        <td><strong>$0.1483 (~15 ₽)</strong> / $0.2394</td>
+      </tr>
+      <tr>
+        <td><strong>736p bf16</strong> (<code>1280×736</code>, 226 к.)</td>
+        <td><strong>368.0 сек</strong> (~52.3 с/шаг)</td>
+        <td>433.6 сек</td>
+        <td>103.0 / 122.5 GiB</td>
+        <td><strong>$0.5701 (~57 ₽)</strong> / $0.6718</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout-info">
+    <strong>Ключевой вывод по экономике:</strong> нативный <code>736p</code> оказался в <strong>3.85×</strong> дольше и дороже
+    <code>480p</code> и требует &gt;122 GiB VRAM. Оптимальный прод-пайплайн для <code>LOKI Remake</code> — рендерить ядро в
+    <code>480p</code> (~1.5 мин, ~$0.15) и прогонять быстрый GPU-апскейл до <code>720p</code>. Весь Шаг 2 (поднятие, 144 GB
+    скачивание, оба рендера и удаление) обошёлся в <strong>$1.49</strong>; остаток на GPUniq: <strong>$110.5270</strong>.
+  </div>
 
   <div class="footer">
     <span>LOKI Remake · Живой проектный документ</span>

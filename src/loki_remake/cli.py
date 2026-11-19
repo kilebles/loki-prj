@@ -12,13 +12,42 @@ from rich.console import Console
 from rich.table import Table
 
 from loki_remake.config import get_settings
+from loki_remake.engine.viggle_bf16 import run_remote_render
 from loki_remake.gpuniq.client import GPUniqClient
+from loki_remake.gpuniq.ops import (
+    clear_active_gpu,
+    ensure_ssh_key,
+    extract_ssh_connection,
+    load_active_gpu,
+    pick_best_h200,
+    rsync_to_remote,
+    run_ssh,
+    save_active_gpu,
+    utc_now_iso,
+    wait_for_ssh_ready,
+)
 from loki_remake.gpuniq.prompter import normalize_ascii_punctuation, validate_minimax_prompt
 from loki_remake.pipeline import prepare_job
-from loki_remake.schemas import RemakeMode, RenderTier
+from loki_remake.schemas import GPUInstanceState, RemakeMode, RenderTier
 
 app = typer.Typer(help="LOKI Remake: Viggle-Remake / MiniMax-H3 preparation and GPUniq tooling.")
 console = Console()
+
+
+def _client_from_settings() -> GPUniqClient:
+    settings = get_settings()
+    return GPUniqClient(
+        api_key=settings.gpuniq_api_key.get_secret_value(),
+        base_url=settings.gpuniq_base_url,
+    )
+
+
+def _require_active_gpu() -> GPUInstanceState:
+    state = load_active_gpu()
+    if state is None:
+        console.print("[red]No active GPU saved in work/active_gpu.json. Run gpu-up first.[/red]")
+        raise typer.Exit(code=1)
+    return state
 
 
 def _configure_logging(level: str) -> None:
@@ -146,6 +175,256 @@ def validate_prompt_cmd(
             console.print(f"[red]ERROR:[/red] {err}")
         raise typer.Exit(code=1)
     console.print("[green]Prompt is valid.[/green]")
+
+
+@app.command("gpu-offers")
+def gpu_offers(
+    gpu: Annotated[str, typer.Option(help="GPU model filter (e.g. H200)")] = "H200",
+    min_ram: Annotated[float, typer.Option(help="Minimum host RAM in GB")] = 150.0,
+    min_down: Annotated[float, typer.Option(help="Minimum download speed in Mbps")] = 500.0,
+    max_price: Annotated[float, typer.Option(help="Maximum price per hour in USD")] = 6.0,
+) -> None:
+    """List matching 1x GPU offers on GPUniq Marketplace."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    models = ["H200", "H200 NVL"] if gpu.upper() == "H200" else [gpu]
+    with _client_from_settings() as client:
+        data = client.list_marketplace(
+            gpu_model=models,
+            max_gpu_count=1,
+            min_ram_gb=min_ram,
+            min_disk_gb=250,
+            min_inet_speed_mbps=min_down,
+            max_price_per_hour=max_price,
+            provider="vast",
+            sort_by="price-low",
+            page_size=20,
+        )
+
+    table = Table(title=f"GPUniq Marketplace 1x {gpu}")
+    table.add_column("Agent ID")
+    table.add_column("Model")
+    table.add_column("VRAM", justify="right")
+    table.add_column("RAM", justify="right")
+    table.add_column("Disk", justify="right")
+    table.add_column("Down", justify="right")
+    table.add_column("Rel", justify="right")
+    table.add_column("$/hr", justify="right")
+    table.add_column("Loc")
+
+    for a in data.get("agents", []):
+        if int(a.get("gpu_count") or 0) != 1:
+            continue
+        table.add_row(
+            str(a["id"]),
+            str(a.get("gpu_model", "")),
+            f"{a.get('vram_gb', 0)} GB",
+            f"{a.get('ram_gb', 0)} GB",
+            f"{a.get('storage_gb', 0)} GB",
+            f"{a.get('down_mbps', 0)} Mbps",
+            f"{float(a.get('reliability') or 0):.3f}",
+            f"${float(a.get('price_per_hour') or 0):.4f}",
+            str(a.get("location", "")),
+        )
+    console.print(table)
+
+
+@app.command("gpu-up")
+def gpu_up(
+    agent_id: Annotated[int | None, typer.Option(help="Explicit Marketplace agent_id")] = None,
+    auto_h200: Annotated[bool, typer.Option(help="Auto-select best fast 1x H200 offer")] = False,
+    disk: Annotated[int, typer.Option(help="Container disk size in GB")] = 250,
+) -> None:
+    """Rent a 1x GPU on GPUniq Marketplace with minute billing and wait for SSH."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+
+    if agent_id is None and not auto_h200:
+        console.print("[red]Pass either --agent-id <ID> or --auto-h200[/red]")
+        raise typer.Exit(code=2)
+
+    priv_key = Path.home() / ".ssh" / "id_ed25519"
+    pub_key = Path.home() / ".ssh" / "id_ed25519.pub"
+
+    with _client_from_settings() as client:
+        ssh_key_id = ensure_ssh_key(client, pubkey_path=pub_key)
+        if agent_id is None:
+            offer = pick_best_h200(client, min_disk_gb=max(250.0, float(disk)))
+            selected_id = int(offer["id"])
+        else:
+            offer = client.get_agent(agent_id)
+            selected_id = agent_id
+
+        gpu_model = str(offer.get("gpu_model") or "H200")
+        price_hr = float(offer.get("price_per_hour") or 0.0)
+        console.print(
+            f"Ordering agent_id={selected_id} ({gpu_model}, "
+            f"{offer.get('ram_gb')}GB RAM, {offer.get('down_mbps')} Mbps) at ${price_hr:.4f}/hr"
+        )
+
+        order = client.create_marketplace_order(
+            agent_id=selected_id,
+            gpu_required=1,
+            pricing_type="minute",
+            docker_image="vastai/pytorch:cuda-12.9.1-auto",
+            ssh_key_ids=[ssh_key_id],
+            disk_gb=disk,
+        )
+        raw_task = (
+            order.get("order_id")
+            or order.get("task_id")
+            or order.get("instance_id")
+            or order.get("id")
+        )
+        if raw_task is None:
+            raise RuntimeError(f"Order response did not include task_id: {order}")
+        task_id = int(raw_task)
+        effective_price = float(order.get("estimated_cost") or price_hr)
+
+        # Save provisioning state immediately so gpu-down can always recover on timeout.
+        provisional = GPUInstanceState(
+            task_id=task_id,
+            agent_id=selected_id,
+            gpu_model=gpu_model,
+            price_per_hour=effective_price,
+            ssh_host="",
+            ssh_port=22,
+            ssh_user="root",
+            ssh_key_path=priv_key,
+            status="provisioning",
+            created_at=utc_now_iso(),
+        )
+        save_active_gpu(provisional)
+        console.print(f"Order created: task_id={task_id}. Waiting for SSH readiness...")
+
+        host, port, user = wait_for_ssh_ready(client, task_id, priv_key)
+        ready_state = provisional.model_copy(
+            update={"ssh_host": host, "ssh_port": port, "ssh_user": user, "status": "running"}
+        )
+        save_active_gpu(ready_state)
+
+    console.print(f"[green]GPU ready:[/green] task_id={task_id} -> ssh -p {port} {user}@{host}")
+
+
+@app.command("gpu-status")
+def gpu_status() -> None:
+    """List active GPUniq instances and local saved GPU state."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    with _client_from_settings() as client:
+        data = client.list_instances()
+
+    instances = data.get("instances", [])
+    total = data.get("total_count", len(instances))
+    console.print(f"[bold]Active GPUniq instances:[/bold] {total}")
+    for inst in instances:
+        host, port, user = extract_ssh_connection(inst)
+        gpu_name = (
+            inst.get("gpu_model")
+            or inst.get("agent", {}).get("gpu", {}).get("model")
+            or "unknown"
+        )
+        console.print(
+            f"  task_id={inst.get('id') or inst.get('task_id')} | "
+            f"status={inst.get('status')} | gpu={gpu_name} | "
+            f"ssh={user}@{host}:{port}"
+        )
+
+    saved = load_active_gpu()
+    if saved:
+        console.print(
+            f"[dim]Local state: task_id={saved.task_id}, {saved.gpu_model}, "
+            f"{saved.ssh_user}@{saved.ssh_host}:{saved.ssh_port} ({saved.status})[/dim]"
+        )
+
+
+@app.command("gpu-setup")
+def gpu_setup() -> None:
+    """Upload and run infra/setup_gpu.sh on the active rented GPU."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    state = _require_active_gpu()
+    script_path = Path("infra/setup_gpu.sh")
+    if not script_path.exists():
+        raise FileNotFoundError(f"Setup script not found: {script_path}")
+
+    rsync_to_remote(
+        state.ssh_host,
+        state.ssh_port,
+        state.ssh_user,
+        state.ssh_key_path,
+        script_path,
+        "/tmp/setup_gpu.sh",
+    )
+    rc, _ = run_ssh(
+        state.ssh_host,
+        state.ssh_port,
+        state.ssh_user,
+        state.ssh_key_path,
+        "chmod +x /tmp/setup_gpu.sh && bash /tmp/setup_gpu.sh",
+        stream=True,
+    )
+    if rc != 0:
+        console.print(f"[red]gpu-setup failed with exit code {rc}[/red]")
+        raise typer.Exit(code=rc)
+    console.print("[green]GPU environment and model weights verified ready.[/green]")
+
+
+@app.command("gpu-render")
+def gpu_render(
+    job_dir: Annotated[Path, typer.Option(exists=True, file_okay=False, help="Prepared job dir")],
+    tier: Annotated[RenderTier | None, typer.Option(help="Override short edge: 480 or 736")] = None,
+    seed: Annotated[int, typer.Option(help="Random seed")] = 0,
+) -> None:
+    """Run MiniMax-H3 + Viggle-Remake bf16 render on the active GPU and download MP4."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    state = _require_active_gpu()
+
+    res = run_remote_render(state, job_dir, short_edge=tier, seed=seed)
+    console.print(f"[green]Rendered {res.out_video_path}[/green]")
+    console.print(
+        f"Geometry: {res.width}x{res.height}, {res.num_frames} frames, audio={res.has_audio} | "
+        f"render={res.render_sec:.1f}s, wall={res.wall_sec:.1f}s | "
+        f"peak VRAM={res.peak_alloc_gib:.1f}/{res.peak_reserved_gib:.1f} GiB | "
+        f"cost=${res.render_cost_usd:.4f} (infer=${res.inference_only_cost_usd:.4f})"
+    )
+
+
+@app.command("gpu-stop")
+def gpu_stop(
+    task_id: Annotated[
+        int | None, typer.Option(help="Instance task_id (defaults to active)")
+    ] = None,
+) -> None:
+    """Stop (pause billing on) a running GPUniq instance."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    target_id = task_id or _require_active_gpu().task_id
+    with _client_from_settings() as client:
+        client.stop_instance(target_id)
+    saved = load_active_gpu()
+    if saved and saved.task_id == target_id:
+        save_active_gpu(saved.model_copy(update={"status": "stopped"}))
+    console.print(f"[yellow]Stopped instance task_id={target_id}[/yellow]")
+
+
+@app.command("gpu-down")
+def gpu_down(
+    task_id: Annotated[
+        int | None, typer.Option(help="Instance task_id (defaults to active)")
+    ] = None,
+) -> None:
+    """Permanently delete a GPUniq instance and clear local active state."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    target_id = task_id or _require_active_gpu().task_id
+    with _client_from_settings() as client:
+        client.delete_instance(target_id)
+    saved = load_active_gpu()
+    if saved and saved.task_id == target_id:
+        clear_active_gpu()
+    console.print(f"[green]Deleted instance task_id={target_id}[/green]")
 
 
 if __name__ == "__main__":

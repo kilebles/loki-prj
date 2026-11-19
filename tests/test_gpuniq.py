@@ -10,6 +10,7 @@ from PIL import Image
 from pytest_httpx import HTTPXMock
 
 from loki_remake.gpuniq.client import GPUniqClient
+from loki_remake.gpuniq.ops import extract_ssh_connection, pick_best_h200
 from loki_remake.gpuniq.painter import paint_keyframe
 from loki_remake.gpuniq.prompter import generate_minimax_prompt
 from loki_remake.schemas import NormalizedVideo, PaintedRef, ShotInfo
@@ -214,3 +215,100 @@ def test_prompter_repair_turn(httpx_mock: HTTPXMock, tmp_path: Path) -> None:
 
     assert "00:09.375" in prompt_text
     assert cost == 0.002
+
+
+def test_pick_best_h200_filters_and_ranks(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        method="GET",
+        url="https://api.gpuniq.com/v1/marketplace/list?sort_by=price-low&page=1&page_size=30&gpu_model=H200&gpu_model=H200+NVL&min_vram_gb=138.0&min_ram_gb=150.0&min_disk_gb=280.0&min_inet_speed_mbps=800.0&max_price_per_hour=6.0&max_gpu_count=1&provider=vast",
+        json={
+            "exception": 0,
+            "data": {
+                "agents": [
+                    {
+                        "id": 1,
+                        "gpu_model": "H200",
+                        "gpu_count": 2,
+                        "status": "online",
+                        "instances_available": 1,
+                        "vram_gb": 280,
+                        "ram_gb": 300,
+                        "storage_gb": 500,
+                        "down_mbps": 5000,
+                        "reliability": 0.99,
+                        "price_per_hour": 4.0,
+                    },
+                    {
+                        "id": 2,
+                        "gpu_model": "H200 NVL",
+                        "gpu_count": 1,
+                        "status": "online",
+                        "instances_available": 1,
+                        "vram_gb": 140,
+                        "ram_gb": 251,
+                        "storage_gb": 900,
+                        "down_mbps": 877,
+                        "reliability": 0.995,
+                        "cuda_max_good": 13.2,
+                        "price_per_hour": 4.88,
+                    },
+                    {
+                        "id": 3,
+                        "gpu_model": "H200 NVL",
+                        "gpu_count": 1,
+                        "status": "online",
+                        "instances_available": 1,
+                        "vram_gb": 140,
+                        "ram_gb": 188,
+                        "storage_gb": 1500,
+                        "down_mbps": 2336,
+                        "reliability": 0.95,
+                        "cuda_max_good": 13.5,
+                        "price_per_hour": 4.52,
+                    },
+                ]
+            },
+        },
+    )
+
+    with GPUniqClient(api_key="gpuniq_test") as client:
+        best = pick_best_h200(client)
+    assert best["id"] == 3
+
+
+def test_extract_ssh_connection_variants() -> None:
+    assert extract_ssh_connection(
+        {"ssh_host": "1.2.3.4", "ssh_port": 22022, "ssh_user": "root"}
+    ) == ("1.2.3.4", 22022, "root")
+
+    assert extract_ssh_connection(
+        {"connection": {"host": "5.6.7.8", "port": "31337"}, "username": "ubuntu"}
+    ) == ("5.6.7.8", 31337, "ubuntu")
+
+    assert extract_ssh_connection(
+        {"ssh_command": "ssh -p 44123 vast@9.8.7.6"}
+    ) == ("9.8.7.6", 44123, "vast")
+
+    assert extract_ssh_connection(
+        {
+            "server_connection": {
+                "ssh_host": "ssh2.gpuniq.com",
+                "ssh_port": 20042,
+                "ssh_username": "root",
+                "direct_ssh_host": "207.148.106.151",
+                "direct_ssh_port": 43499,
+            }
+        }
+    ) == ("207.148.106.151", 43499, "root")
+
+    assert extract_ssh_connection(
+        {
+            "container": {
+                "ssh_host": "ssh2.gpuniq.com",
+                "ssh_port": 20042,
+                "ssh_username": "root",
+                "direct_ssh_host": "207.148.106.151",
+                "direct_ssh_port": 43499,
+            }
+        }
+    ) == ("207.148.106.151", 43499, "root")

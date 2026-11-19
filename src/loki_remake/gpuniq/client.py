@@ -181,6 +181,74 @@ class GPUniqClient:
     def get_instance(self, task_id: int) -> dict[str, Any]:
         return self._request("GET", f"/v1/instances/{task_id}")["data"]
 
+    def get_instance_logs(self, task_id: int) -> dict[str, Any]:
+        return self._request("GET", f"/v1/instances/{task_id}/logs")["data"]
+
+    def list_marketplace(
+        self,
+        *,
+        gpu_model: list[str] | None = None,
+        min_vram_gb: float | None = None,
+        min_ram_gb: float | None = None,
+        min_disk_gb: float | None = None,
+        min_inet_speed_mbps: float | None = None,
+        max_price_per_hour: float | None = None,
+        max_gpu_count: int | None = None,
+        provider: str | None = None,
+        sort_by: str = "price-low",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "sort_by": sort_by,
+            "page": page,
+            "page_size": page_size,
+        }
+        if gpu_model:
+            params["gpu_model"] = gpu_model
+        if min_vram_gb is not None:
+            params["min_vram_gb"] = min_vram_gb
+        if min_ram_gb is not None:
+            params["min_ram_gb"] = min_ram_gb
+        if min_disk_gb is not None:
+            params["min_disk_gb"] = min_disk_gb
+        if min_inet_speed_mbps is not None:
+            params["min_inet_speed_mbps"] = min_inet_speed_mbps
+        if max_price_per_hour is not None:
+            params["max_price_per_hour"] = max_price_per_hour
+        if max_gpu_count is not None:
+            params["max_gpu_count"] = max_gpu_count
+        if provider:
+            params["provider"] = provider
+        return self._request("GET", "/v1/marketplace/list", params=params)["data"]
+
+    def get_agent(self, agent_id: int) -> dict[str, Any]:
+        return self._request("GET", f"/v1/marketplace/agent/{agent_id}")["data"]
+
+    def create_marketplace_order(
+        self,
+        *,
+        agent_id: int,
+        gpu_required: int = 1,
+        pricing_type: str = "minute",
+        docker_image: str = "vastai/pytorch:cuda-12.9.1-auto",
+        ssh_key_ids: list[int] | None = None,
+        disk_gb: int = 250,
+        volume_id: int | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "agent_id": agent_id,
+            "gpu_required": gpu_required,
+            "pricing_type": pricing_type,
+            "docker_image": docker_image,
+            "disk_gb": disk_gb,
+        }
+        if ssh_key_ids:
+            body["ssh_key_ids"] = ssh_key_ids
+        if volume_id is not None:
+            body["volume_id"] = volume_id
+        return self._request("POST", "/v1/marketplace/order", json=body, timeout=120.0)["data"]
+
     def list_volumes(self) -> list[dict[str, Any]]:
         return self._request("GET", "/v1/volumes/")["data"]
 
