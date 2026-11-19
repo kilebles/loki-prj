@@ -97,7 +97,7 @@ def _has_audio_stream(path: Path) -> bool:
 def _mux_audio(video_raw: Path, audio_src: Path, out_path: Path) -> dict[str, Any]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     has_audio = _has_audio_stream(audio_src)
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video_raw)]
+    cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(video_raw)]
     if has_audio:
         cmd.extend(["-i", str(audio_src), "-map", "0:v:0", "-map", "1:a:0"])
     else:
@@ -106,7 +106,7 @@ def _mux_audio(video_raw: Path, audio_src: Path, out_path: Path) -> dict[str, An
     if has_audio:
         cmd.extend(["-c:a", "aac", "-b:a", "192k", "-shortest"])
     cmd.append(str(out_path))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, stdin=subprocess.DEVNULL, check=True)
     return _probe_basic(out_path)
 
 
