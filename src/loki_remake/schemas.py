@@ -124,3 +124,27 @@ class RenderResult(BaseModel):
     inference_only_cost_usd: float = 0.0
     out_video_path: Path
     has_audio: bool = False
+
+
+class UpscaleResult(BaseModel):
+    """Measured output, timing, and cost telemetry for one video upscaler run."""
+
+    name: str
+    method: str
+    backend: Literal["topaz_api", "self_hosted_gpu", "baseline"]
+    source_video_path: Path
+    out_video_path: Path
+    width: int
+    height: int
+    fps: float
+    num_frames: int
+    has_audio: bool
+    wall_sec: float
+    inference_sec: float
+    peak_vram_gib: float = 0.0
+    credits: float | None = None
+    upscale_cost_usd: float = 0.0
+    gpu_model: str | None = None
+    gpu_price_per_hour: float | None = None
+    notes: str = ""
+

@@ -314,6 +314,18 @@
       break-inside: avoid;
     }
 
+    table.compact {
+      font-size: 7.9pt;
+    }
+
+    table.compact th, table.compact td {
+      padding: 3.8px 5.5px;
+    }
+
+    tr.row-win {
+      background: #f0fdf4;
+    }
+
     .footer {
       margin-top: 12px;
       padding-top: 6px;
@@ -334,7 +346,7 @@
       </div>
     </div>
     <div class="meta-badges">
-      <div class="badge">Шаги 0–2 завершены</div>
+      <div class="badge">Шаги 0–2 + Апскейл-бенчмарк</div>
       <div>Обновлено: 2026-11-19</div>
       <div>Репозиторий: <code>kilebles/loki-prj</code></div>
     </div>
@@ -497,13 +509,13 @@
       </tr>
       <tr>
         <td>Качество кода и автотесты</td>
-        <td><code>ruff</code> 0 ошибок · <code>pytest</code> <strong>16/16 passed</strong></td>
-        <td>Покрытие: нормализация, сцены, валидатор, движок <code>sample.py</code>, mock GPUniq + SSH</td>
+        <td><code>ruff</code> 0 ошибок · <code>pytest</code> <strong>21/21 passed</strong></td>
+        <td>Покрытие: нормализация, сцены, валидатор, движок <code>sample.py</code>, апскейл + кропы, mock GPUniq + SSH</td>
       </tr>
       <tr>
-        <td>Баланс аккаунта GPUniq после Шага 2</td>
-        <td><strong>$110.5270</strong> (свободно)</td>
-        <td>Потрачено на весь Шаг 2: <strong>$1.4872</strong> (активных инстансов: <code>0</code>)</td>
+        <td>Баланс аккаунта GPUniq</td>
+        <td><strong>$109.7994</strong> (свободно)</td>
+        <td>Шаг 2 (H200): <strong>$1.4872</strong> · Апскейл-бенчмарк (A100): <strong>$0.7276</strong> (активных GPU: <code>0</code>)</td>
       </tr>
     </tbody>
   </table>
@@ -530,13 +542,18 @@
       </tr>
       <tr>
         <td><strong>Шаг 2</strong> — GPU-стенд на GPUniq</td>
-        <td><span class="status-done">Готово · H200 OK</span></td>
+        <td><span class="status-done">Готово · 86e8c5d</span></td>
         <td>Провижининг, <code>setup_gpu.sh</code> (4 мин 12 с), замеры <code>480p</code> (95.7s) vs <code>736p</code> (368.0s), автоудаление</td>
       </tr>
       <tr>
-        <td><strong>Шаг 3</strong> — Прогон кейсов Насти + апскейл</td>
+        <td><strong>Шаг 2b</strong> — Бенчмарк апскейлеров <code>480p → 736p</code></td>
+        <td><span class="status-done">Готово · 5 GPU + Topaz</span></td>
+        <td>Замеры <code>Real-ESRGAN</code> (x2plus, x4v3), <code>SeedVR2</code> (3B, 7B, 7B Sharp) на <code>A100 SXM4</code>, проверка Topaz API и сравнение с <code>736p</code></td>
+      </tr>
+      <tr>
+        <td><strong>Шаг 3</strong> — Прогон кейсов Насти + <code>Q8_0</code></td>
         <td><span class="status-pending">Ожидает роликов Насти</span></td>
-        <td>Тест 5–7 реальных роликов (<code>swap</code>/<code>edit</code>), подключение апскейла <code>480→720</code> и проверка <code>Q8_0</code> на PRO 6000</td>
+        <td>Тест 5–7 реальных <code>9:16</code> роликов (<code>swap</code>/<code>edit</code>) с лучшим апскейлом и проверка <code>Q8_0</code> на <code>RTX PRO 6000 96GB</code></td>
       </tr>
       <tr>
         <td><strong>Шаг 4</strong> — Сдача PoC и переход в прод</td>
@@ -592,9 +609,138 @@
 
   <div class="callout-info">
     <strong>Ключевой вывод по экономике:</strong> нативный <code>736p</code> оказался в <strong>3.85×</strong> дольше и дороже
-    <code>480p</code> и требует &gt;122 GiB VRAM. Оптимальный прод-пайплайн для <code>LOKI Remake</code> — рендерить ядро в
-    <code>480p</code> (~1.5 мин, ~$0.15) и прогонять быстрый GPU-апскейл до <code>720p</code>. Весь Шаг 2 (поднятие, 144 GB
-    скачивание, оба рендера и удаление) обошёлся в <strong>$1.49</strong>; остаток на GPUniq: <strong>$110.5270</strong>.
+    <code>480p</code> и требует &gt;122 GiB VRAM. Ниже — прямой замер всех способов дотянуть <code>480p</code> до
+    <code>736p</code> по качеству, скорости и деньгам. Остаток на GPUniq: <strong>$109.7994</strong>.
+  </div>
+
+  <h2 class="page-break">6. Сравнение апскейлеров 480p → 736p (качество, скорость, цена)</h2>
+  <p>
+    На одном и том же рендере <code>out_480.mp4</code> (<code>832×480</code>, 9.42 сек, 226 кадров, звук сохранён)
+    протестированы 5 нейросетевых апскейлеров на <code>1× A100 SXM4 40GB</code> (<code>$1.1376/ч</code>),
+    быстрый CPU <code>FFmpeg Lanczos</code>, облачный <code>Topaz Proteus API</code> и эталонный нативный <code>736p</code> на <code>H200</code>.
+  </p>
+
+  <table class="compact">
+    <thead>
+      <tr>
+        <th>Вариант</th>
+        <th>Разрешение</th>
+        <th>Апскейл</th>
+        <th>Итого GPU</th>
+        <th>Цена апскейла</th>
+        <th>Итого за ролик*</th>
+        <th>Визуальный вердикт</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1. <strong>Raw 480p</strong> (H200 bf16)</td>
+        <td><code>832×480</code></td>
+        <td>—</td>
+        <td>95.7 сек</td>
+        <td>$0</td>
+        <td>$0.2066 (~21 ₽)</td>
+        <td>Мутное лицо и борода — как финал не годится</td>
+      </tr>
+      <tr>
+        <td>2. 480p + <strong>FFmpeg Lanczos</strong></td>
+        <td><code>1280×736</code></td>
+        <td>2.0 сек</td>
+        <td>95.7 сек</td>
+        <td>$0</td>
+        <td>$0.2066 (~21 ₽)</td>
+        <td>Простое растягивание без деталей (контроль)</td>
+      </tr>
+      <tr class="row-win">
+        <td>3. 480p + <strong>Real-ESRGAN general-x4v3</strong></td>
+        <td><code>1280×736</code></td>
+        <td><strong>11.8 с</strong> (0.24 GiB)</td>
+        <td><strong>107.5 с</strong> (1.8 мин)</td>
+        <td><strong>$0.0037</strong> (&lt;0.5 ₽)</td>
+        <td><strong>$0.2103 (~21 ₽)</strong></td>
+        <td><strong>Лидер скорость/цена:</strong> чёткая куртка, кепка, брови без дрейфа лица; лёгкое сглаживание кожи</td>
+      </tr>
+      <tr>
+        <td>4. 480p + <strong>Real-ESRGAN x2plus</strong></td>
+        <td><code>1280×736</code></td>
+        <td>27.2 с (0.81 GiB)</td>
+        <td>122.9 с (2.0 мин)</td>
+        <td>$0.0086 (~1 ₽)</td>
+        <td>$0.2152 (~22 ₽)</td>
+        <td>Кожа чуть мягче, чем у <code>x4v3</code>, но слабее мелкие детали при 2.3× большем времени</td>
+      </tr>
+      <tr>
+        <td>5. 480p + <strong>SeedVR2-3B FP16</strong></td>
+        <td><code>1280×736</code></td>
+        <td>161.4 с (16.7 GiB)</td>
+        <td>257.1 с (4.3 мин)</td>
+        <td>$0.0510 (~5 ₽)</td>
+        <td>$0.2576 (~26 ₽)</td>
+        <td>Диффузия дорисовывает глаза и надписи в смазе, но +2.7 мин на A100</td>
+      </tr>
+      <tr>
+        <td>6. 480p + <strong>SeedVR2-7B FP8</strong></td>
+        <td><code>1280×736</code></td>
+        <td>163.0 с (16.7 GiB)</td>
+        <td>258.7 с (4.3 мин)</td>
+        <td>$0.0515 (~5 ₽)</td>
+        <td>$0.2581 (~26 ₽)</td>
+        <td>Близко к <code>3B</code>, без явного выигрыша против <code>7B Sharp</code></td>
+      </tr>
+      <tr class="row-win">
+        <td>7. 480p + <strong>SeedVR2-7B Sharp FP8</strong></td>
+        <td><code>1280×736</code></td>
+        <td>168.9 с (16.7 GiB)</td>
+        <td>264.6 с (4.4 мин)</td>
+        <td>$0.0534 (~5 ₽)</td>
+        <td><strong>$0.2600 (~26 ₽)</strong></td>
+        <td><strong>Лучший апскейл по деталям:</strong> самые чёткие глаза, кожа куртки и фон; на H200/5090 быстрее</td>
+      </tr>
+      <tr>
+        <td>8. 480p + <strong>Topaz Proteus (API)</strong></td>
+        <td><code>1280×736</code></td>
+        <td>&gt; 49 мин (таймаут)</td>
+        <td>—</td>
+        <td>оценка $0.28 ($0 спис.)</td>
+        <td>—</td>
+        <td>2 запуска зависли в <code>processing</code> &gt; 49 мин — не подходит под SLA 1.5–3 мин</td>
+      </tr>
+      <tr>
+        <td>9. <strong>Native 736p</strong> (H200 bf16)</td>
+        <td><code>1280×736</code></td>
+        <td>—</td>
+        <td>368.0 с (6.1 мин)</td>
+        <td>—</td>
+        <td>$0.6284 (~63 ₽)</td>
+        <td><strong>Эталон качества:</strong> натуральная кожа и мимика в движении, но в 3× дороже и 3.4× дольше</td>
+      </tr>
+    </tbody>
+  </table>
+  <p style="font-size: 7.7pt; color: #64748b; margin-top: -4px;">
+    * «Итого за ролик» = подготовка VLM/Nano Banana (<code>$0.0583</code>) + инференс H200 <code>480p</code> (<code>$0.1483</code>) + апскейл на A100 (или натив <code>736p</code> <code>$0.5701</code>). Ориентир ~100 ₽/$.
+  </p>
+
+  <div class="strip-card">
+    <img src="assets/upscale_compare_crops.jpg" alt="1:1 зум лица, кепки и куртки across 8 вариантов" />
+    <div class="strip-caption">
+      1:1 кропы (кадр 200 / 8.33s, синхронизированы по исходному таймкоду): лицо, щетина, кепка и красная кожаная куртка на всех 8 рабочих вариантах
+    </div>
+  </div>
+
+  <div class="page-break"></div>
+  <h2>7. Итоговый полный кадр и выбор продакшен-архитектуры</h2>
+  <div class="strip-card">
+    <img src="assets/upscale_compare_full.jpg" alt="Полный кадр топ-4 финалистов" />
+    <div class="strip-caption">
+      Полный кадр (2×2 финалисты): Raw 480p · Real-ESRGAN general-x4v3 · SeedVR2-7B Sharp FP8 · Native 736p
+    </div>
+  </div>
+
+  <div class="callout-info">
+    <strong>Рекомендация для LOKI Remake (2 продуктовых тарифа, без внешнего Topaz API):</strong><br/>
+    1. <strong>Standard / Fast (по умолчанию):</strong> рендер <code>480p</code> + <code>Real-ESRGAN general-x4v3</code> прямо на том же H200/PRO 6000 воркере (всего +11.8 сек и ~0.24 GiB VRAM, не нужен отдельный сервер). Итого <strong>~1.8 мин GPU и ~$0.21 (~21 ₽)</strong> вместо ~6.1 мин и ~$0.63 (~63 ₽) за нативный <code>736p</code> — экономия <strong>3×</strong> при заметно более чёткой одежде и фоне.<br/>
+    2. <strong>HQ / Pro (сложные планы лиц и быстрое движение):</strong> <code>480p</code> + <code>SeedVR2-7B Sharp FP8</code> (~<strong>$0.26 / ~26 ₽</strong>; в коде уже убран <code>--prepend_frames 4</code> для 100% синхра звука) либо нативный <code>736p</code> (~63 ₽) для премиум-запросов.<br/>
+    3. <strong>Следующий шаг (Шаг 3):</strong> прогнать 5–7 реальных вертикальных клипов <code>9:16</code> от Насти и замерить <code>Q8_0</code> на <code>RTX PRO 6000 96GB</code>.
   </div>
 
   <div class="footer">

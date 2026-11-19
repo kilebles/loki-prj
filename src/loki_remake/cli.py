@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -13,13 +14,15 @@ from rich.table import Table
 
 from loki_remake.config import get_settings
 from loki_remake.engine.viggle_bf16 import run_remote_render
-from loki_remake.gpuniq.client import GPUniqClient
+from loki_remake.gpuniq.client import GPUniqAPIError, GPUniqClient
 from loki_remake.gpuniq.ops import (
     clear_active_gpu,
     ensure_ssh_key,
     extract_ssh_connection,
     load_active_gpu,
     pick_best_h200,
+    rank_upscaler_gpus,
+    rsync_from_remote,
     rsync_to_remote,
     run_ssh,
     save_active_gpu,
@@ -28,7 +31,8 @@ from loki_remake.gpuniq.ops import (
 )
 from loki_remake.gpuniq.prompter import normalize_ascii_punctuation, validate_minimax_prompt
 from loki_remake.pipeline import prepare_job
-from loki_remake.schemas import GPUInstanceState, RemakeMode, RenderTier
+from loki_remake.schemas import GPUInstanceState, RemakeMode, RenderTier, UpscaleResult
+from loki_remake.video.upscale import upscale_via_topaz
 
 app = typer.Typer(help="LOKI Remake: Viggle-Remake / MiniMax-H3 preparation and GPUniq tooling.")
 console = Console()
@@ -425,6 +429,252 @@ def gpu_down(
     if saved and saved.task_id == target_id:
         clear_active_gpu()
     console.print(f"[green]Deleted instance task_id={target_id}[/green]")
+
+
+@app.command("topaz-models")
+def topaz_models() -> None:
+    """List Topaz Video AI models exposed by GPUniq Media API."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    with _client_from_settings() as client:
+        data = client.list_topaz_models()
+
+    table = Table(title=f"Topaz Video Models (${data.get('usd_per_credit', 0.14)}/credit)")
+    table.add_column("Slug")
+    table.add_column("Family")
+    table.add_column("Description")
+    for m in data.get("video_models", []):
+        table.add_row(str(m["slug"]), str(m.get("family", "")), str(m.get("description", "")))
+    console.print(table)
+
+
+@app.command("upscale-topaz")
+def upscale_topaz(
+    video: Annotated[Path, typer.Option(exists=True, readable=True, help="Input MP4 file")],
+    model: Annotated[str, typer.Option(help="Topaz video model slug")] = "topaz-video-proteus",
+    out: Annotated[Path | None, typer.Option(help="Output upscaled MP4 path")] = None,
+    width: Annotated[int, typer.Option(help="Target output width")] = 1280,
+    height: Annotated[int, typer.Option(help="Target output height")] = 736,
+    video_url: Annotated[str | None, typer.Option(help="Pre-hosted HTTPS URL")] = None,
+    allow_temp_upload: Annotated[
+        bool, typer.Option(help="Fallback to expiring temp HTTPS host if data URI rejected")
+    ] = False,
+) -> None:
+    """Upscale a video via GPUniq Topaz Video AI API and preserve source audio."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    slug_short = model.replace("topaz-video-", "")
+    out_path = out or video.with_name(f"{video.stem}_{slug_short}.mp4")
+
+    with _client_from_settings() as client:
+        res = upscale_via_topaz(
+            client,
+            video,
+            out_path,
+            model=model,
+            output_width=width,
+            output_height=height,
+            video_url=video_url,
+            allow_temp_upload=allow_temp_upload,
+        )
+
+    meta_path = out_path.with_suffix(".json")
+    meta_path.write_text(res.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    console.print(f"[green]Topaz upscaled {res.out_video_path}[/green]")
+    console.print(
+        f"Geometry: {res.width}x{res.height} @ {res.fps}fps "
+        f"({res.num_frames}f, audio={res.has_audio}) | "
+        f"wall={res.wall_sec:.1f}s | credits={res.credits} | cost=${res.upscale_cost_usd:.4f}"
+    )
+
+
+@app.command("gpu-upscale-bench")
+def gpu_upscale_bench(
+    video: Annotated[Path, typer.Option(exists=True, readable=True, help="Input MP4 file")],
+    out_dir: Annotated[Path, typer.Option(help="Output directory for upscaled MP4s")] = Path(
+        "work/smoke_test"
+    ),
+    width: Annotated[int, typer.Option(help="Target width")] = 1280,
+    height: Annotated[int, typer.Option(help="Target height")] = 736,
+    disk: Annotated[int, typer.Option(help="Container disk size in GB")] = 120,
+    agent_id: Annotated[int | None, typer.Option(help="Explicit Marketplace agent_id")] = None,
+) -> None:
+    """Rent a cheap 1x GPU, benchmark self-hosted upscalers, and always tear down."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    setup_script = Path("infra/setup_upscaler_gpu.sh")
+    runner_script = Path("infra/run_gpu_upscalers.py")
+    if not setup_script.exists() or not runner_script.exists():
+        raise FileNotFoundError("Missing infra/setup_upscaler_gpu.sh or infra/run_gpu_upscalers.py")
+
+    priv_key = Path.home() / ".ssh" / "id_ed25519"
+    pub_key = Path.home() / ".ssh" / "id_ed25519.pub"
+    task_id: int | None = None
+
+    with _client_from_settings() as client:
+        ssh_key_id = ensure_ssh_key(client, pubkey_path=pub_key)
+        candidates = (
+            [client.get_agent(agent_id)]
+            if agent_id is not None
+            else rank_upscaler_gpus(client, min_disk_gb=float(disk))
+        )
+
+        order: dict[str, object] | None = None
+        selected_offer: dict[str, object] | None = None
+        last_order_err: Exception | None = None
+        for offer in candidates[:8]:
+            selected_id = int(offer["id"])
+            gpu_model = str(offer.get("gpu_model") or "GPU")
+            price_hr = float(offer.get("price_per_hour") or 0.0)
+            console.print(
+                f"Ordering upscaler GPU agent_id={selected_id} ({gpu_model}, "
+                f"{offer.get('vram_gb')}GB VRAM, "
+                f"{offer.get('down_mbps')} Mbps) at ${price_hr:.4f}/hr"
+            )
+            try:
+                order = client.create_marketplace_order(
+                    agent_id=selected_id,
+                    gpu_required=1,
+                    pricing_type="minute",
+                    docker_image="vastai/pytorch:cuda-12.9.1-auto",
+                    ssh_key_ids=[ssh_key_id],
+                    disk_gb=disk,
+                )
+                selected_offer = offer
+                break
+            except GPUniqAPIError as exc:
+                last_order_err = exc
+                console.print(f"[yellow]Offer agent_id={selected_id} skipped: {exc}[/yellow]")
+                continue
+
+        if order is None or selected_offer is None:
+            raise RuntimeError(f"All upscaler GPU order attempts failed: {last_order_err}")
+
+        selected_id = int(selected_offer["id"])
+        gpu_model = str(selected_offer.get("gpu_model") or "GPU")
+        price_hr = float(selected_offer.get("price_per_hour") or 0.0)
+        raw_task = (
+            order.get("order_id")
+            or order.get("task_id")
+            or order.get("instance_id")
+            or order.get("id")
+        )
+        if raw_task is None:
+            raise RuntimeError(f"Order response did not include task_id: {order}")
+        task_id = int(raw_task)
+        effective_price = float(order.get("estimated_cost") or price_hr)
+
+        state = GPUInstanceState(
+            task_id=task_id,
+            agent_id=selected_id,
+            gpu_model=gpu_model,
+            price_per_hour=effective_price,
+            ssh_host="",
+            ssh_port=22,
+            ssh_user="root",
+            ssh_key_path=priv_key,
+            status="provisioning",
+            created_at=utc_now_iso(),
+        )
+        save_active_gpu(state)
+        console.print(f"Created task_id={task_id}. Waiting for SSH...")
+
+        try:
+            host, port, user = wait_for_ssh_ready(client, task_id, priv_key)
+            state = state.model_copy(
+                update={"ssh_host": host, "ssh_port": port, "ssh_user": user, "status": "running"}
+            )
+            save_active_gpu(state)
+
+            rsync_to_remote(host, port, user, priv_key, setup_script, "/tmp/setup_upscaler_gpu.sh")
+            rc, _ = run_ssh(
+                host,
+                port,
+                user,
+                priv_key,
+                "chmod +x /tmp/setup_upscaler_gpu.sh && bash /tmp/setup_upscaler_gpu.sh",
+                stream=True,
+            )
+            if rc != 0:
+                raise RuntimeError(f"setup_upscaler_gpu.sh failed with exit code {rc}")
+
+            remote_in = f"/workspace/in/{video.name}"
+            rsync_to_remote(host, port, user, priv_key, video, remote_in)
+            rsync_to_remote(
+                host, port, user, priv_key, runner_script, "/workspace/run_gpu_upscalers.py"
+            )
+
+            run_cmd = (
+                "PY_BIN=$(cat /workspace/upscaler_python.txt) && "
+                f"\"$PY_BIN\" /workspace/run_gpu_upscalers.py "
+                f"--input {remote_in} --out-dir /workspace/out "
+                f"--target-width {width} --target-height {height}"
+            )
+            rc, _ = run_ssh(host, port, user, priv_key, run_cmd, stream=True)
+            if rc != 0:
+                raise RuntimeError(f"run_gpu_upscalers.py failed with exit code {rc}")
+
+            rsync_from_remote(
+                host,
+                port,
+                user,
+                priv_key,
+                "/workspace/out/remote_upscale_results.json",
+                out_dir / "remote_upscale_results.json",
+            )
+            summary_file = out_dir / "remote_upscale_results.json"
+            summary = json.loads(summary_file.read_text(encoding="utf-8"))
+            upscale_results: list[UpscaleResult] = []
+
+            for item in summary.get("results", []):
+                fname = str(item["out_filename"])
+                rsync_from_remote(
+                    host, port, user, priv_key, f"/workspace/out/{fname}", out_dir / fname
+                )
+                local_out = out_dir / fname
+                infer_sec = float(item["inference_sec"])
+                wall_sec = float(item["wall_sec"])
+                gpu_cost_infer = round(effective_price * (infer_sec / 3600.0), 4)
+                upscale_results.append(
+                    UpscaleResult(
+                        name=str(item["name"]),
+                        method=str(item["method"]),
+                        backend="self_hosted_gpu",
+                        source_video_path=video,
+                        out_video_path=local_out,
+                        width=int(item["width"]),
+                        height=int(item["height"]),
+                        fps=float(item["fps"]),
+                        num_frames=int(item["num_frames"]),
+                        has_audio=bool(item["has_audio"]),
+                        wall_sec=wall_sec,
+                        inference_sec=infer_sec,
+                        peak_vram_gib=float(item.get("peak_vram_gib") or 0.0),
+                        upscale_cost_usd=gpu_cost_infer,
+                        gpu_model=gpu_model,
+                        gpu_price_per_hour=effective_price,
+                        notes=str(item.get("notes") or f"dl={item.get('download_sec', 0)}s"),
+                    )
+                )
+
+            summary["gpu_price_per_hour"] = effective_price
+            summary["gpu_model_ordered"] = gpu_model
+            summary["typed_results"] = [r.model_dump(mode="json") for r in upscale_results]
+            summary_file.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+            console.print(f"[green]Saved self-hosted upscaler results to {summary_file}[/green]")
+        finally:
+            if task_id is not None:
+                try:
+                    client.delete_instance(task_id)
+                    clear_active_gpu()
+                    console.print(f"[green]Auto-deleted upscaler GPU task_id={task_id}[/green]")
+                except Exception as del_exc:
+                    console.print(
+                        f"[red]WARNING: failed to auto-delete task_id={task_id}: {del_exc}[/red]"
+                    )
+                    raise
 
 
 if __name__ == "__main__":

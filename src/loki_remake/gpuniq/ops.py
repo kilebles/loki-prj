@@ -34,6 +34,10 @@ def _ssh_base_args(ssh_key_path: Path, port: int) -> list[str]:
         "UserKnownHostsFile=/dev/null",
         "-o",
         "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=6",
         "-i",
         str(ssh_key_path),
         "-p",
@@ -70,13 +74,14 @@ def ensure_ssh_key(
     return key_id
 
 
-def _filter_h200_candidates(
+def _filter_gpu_candidates(
     agents: list[dict[str, Any]],
     *,
     min_reliability: float,
     min_vram_gb: float,
     min_ram_gb: float,
     min_disk_gb: float,
+    min_cuda: float = 12.8,
 ) -> list[dict[str, Any]]:
     valid: list[dict[str, Any]] = []
     for a in agents:
@@ -95,7 +100,7 @@ def _filter_h200_candidates(
         if float(a.get("reliability") or 0) < min_reliability:
             continue
         cuda_max = a.get("cuda_max_good")
-        if cuda_max is not None and float(cuda_max) < 12.8:
+        if cuda_max is not None and float(cuda_max) < min_cuda:
             continue
         valid.append(a)
     return valid
@@ -125,12 +130,13 @@ def pick_best_h200(
             sort_by="price-low",
             page_size=30,
         )
-        candidates = _filter_h200_candidates(
+        candidates = _filter_gpu_candidates(
             resp.get("agents", []),
             min_reliability=min_reliability,
             min_vram_gb=min_vram_gb,
             min_ram_gb=min_ram_gb,
             min_disk_gb=min_disk_gb,
+            min_cuda=12.8,
         )
         if candidates:
             return min(
@@ -146,6 +152,76 @@ def pick_best_h200(
         "No matching 1x H200 offer found on GPUniq Marketplace "
         f"(RAM>={min_ram_gb}GB, disk>={min_disk_gb}GB, max_price=${max_price}/h)"
     )
+
+
+def rank_upscaler_gpus(
+    client: GPUniqClient,
+    *,
+    min_disk_gb: float = 80.0,
+    min_down_mbps: float = 500.0,
+    min_reliability: float = 0.96,
+) -> list[dict[str, Any]]:
+    """Return ranked affordable reliable 1x GPUs (40GB+ A100/L40S first, then 5090/4090)."""
+    tiers: list[tuple[list[str], float, float, float]] = [
+        (["A100 SXM4", "L40S", "A100 PCIe"], 39.0, 40.0, 1.30),
+        (["RTX 5090", "RTX 4090"], 23.0, 30.0, 1.00),
+    ]
+    ranked: list[dict[str, Any]] = []
+    for gpu_models, min_vram, min_ram, max_price in tiers:
+        resp = client.list_marketplace(
+            gpu_model=gpu_models,
+            max_gpu_count=1,
+            min_vram_gb=min_vram,
+            min_ram_gb=min_ram,
+            min_disk_gb=min_disk_gb,
+            min_inet_speed_mbps=min_down_mbps,
+            max_price_per_hour=max_price,
+            provider="vast",
+            sort_by="price-low",
+            page_size=20,
+        )
+        candidates = _filter_gpu_candidates(
+            resp.get("agents", []),
+            min_reliability=min_reliability,
+            min_vram_gb=min_vram,
+            min_ram_gb=min_ram,
+            min_disk_gb=min_disk_gb,
+            min_cuda=12.1,
+        )
+        ranked.extend(
+            sorted(
+                candidates,
+                key=lambda a: (
+                    0 if float(a.get("down_mbps") or 0) >= 1500.0 else 1,
+                    float(a.get("price_per_hour") or 999.0),
+                    -float(a.get("down_mbps") or 0.0),
+                ),
+            )
+        )
+
+    if ranked:
+        return ranked
+
+    raise RuntimeError(
+        "No matching 1x upscaler GPU found on GPUniq Marketplace "
+        "(A100/L40S <= $1.30/h or RTX 5090/4090 <= $1.00/h)"
+    )
+
+
+def pick_best_upscaler_gpu(
+    client: GPUniqClient,
+    *,
+    min_disk_gb: float = 80.0,
+    min_down_mbps: float = 500.0,
+    min_reliability: float = 0.96,
+) -> dict[str, Any]:
+    """Select an affordable reliable 1x GPU (preferring 40GB+ A100/L40S, fallback 5090/4090)."""
+    return rank_upscaler_gpus(
+        client,
+        min_disk_gb=min_disk_gb,
+        min_down_mbps=min_down_mbps,
+        min_reliability=min_reliability,
+    )[0]
 
 
 def extract_ssh_connection(instance_data: dict[str, Any]) -> tuple[str | None, int | None, str]:
@@ -294,7 +370,8 @@ def rsync_to_remote(
     """Upload a file or directory to remote GPU over rsync+ssh."""
     ssh_flag = (
         f"ssh -i {key_path} -p {port} -o BatchMode=yes "
-        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        "-o ServerAliveInterval=30 -o ServerAliveCountMax=6"
     )
     src = f"{local_path}/" if local_path.is_dir() else str(local_path)
     cmd = ["rsync", "-az", "--progress", "-e", ssh_flag, src, f"{user}@{host}:{remote_path}"]
@@ -313,7 +390,8 @@ def rsync_from_remote(
     local_path.parent.mkdir(parents=True, exist_ok=True)
     ssh_flag = (
         f"ssh -i {key_path} -p {port} -o BatchMode=yes "
-        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        "-o ServerAliveInterval=30 -o ServerAliveCountMax=6"
     )
     cmd = [
         "rsync",

@@ -300,5 +300,16 @@ class GPUniqClient:
     def get_image_job(self, job_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/llm/images/jobs/{job_id}", timeout=60.0)["data"]
 
+    def list_topaz_models(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/llm/topaz/models", timeout=60.0)["data"]
+
+    def create_topaz_video_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", "/v1/llm/topaz/video/jobs", json=payload, timeout=120.0)[
+            "data"
+        ]
+
+    def get_topaz_video_job(self, job_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/v1/llm/topaz/video/jobs/{job_id}", timeout=60.0)["data"]
+
     def chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/v1/openai/chat/completions", json=payload, timeout=120.0)
