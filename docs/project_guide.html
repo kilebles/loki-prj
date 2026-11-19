@@ -346,8 +346,8 @@
       </div>
     </div>
     <div class="meta-badges">
-      <div class="badge">Шаги 0–2 + Апскейл-бенчмарк</div>
-      <div>Обновлено: 2026-11-19</div>
+      <div class="badge">Шаги 0–2c + PRO 6000 FP8 + Face Swap</div>
+      <div>Обновлено: 2026-11-20</div>
       <div>Репозиторий: <code>kilebles/loki-prj</code></div>
     </div>
   </div>
@@ -509,13 +509,13 @@
       </tr>
       <tr>
         <td>Качество кода и автотесты</td>
-        <td><code>ruff</code> 0 ошибок · <code>pytest</code> <strong>21/21 passed</strong></td>
-        <td>Покрытие: нормализация, сцены, валидатор, движок <code>sample.py</code>, апскейл + кропы, mock GPUniq + SSH</td>
+        <td><code>ruff</code> 0 ошибок · <code>pytest</code> <strong>25/25 passed</strong></td>
+        <td>Покрытие: нормализация, сцены, валидатор, движок <code>sample.py</code>, апскейл, <code>user_refs</code>, <code>run_ssh</code> таймер</td>
       </tr>
       <tr>
         <td>Баланс аккаунта GPUniq</td>
-        <td><strong>$109.7994</strong> (свободно)</td>
-        <td>Шаг 2 (H200): <strong>$1.4872</strong> · Апскейл-бенчмарк (A100): <strong>$0.7276</strong> (активных GPU: <code>0</code>)</td>
+        <td><strong>$102.4016</strong> (свободно)</td>
+        <td>Шаг 2 (H200): <strong>$1.4872</strong> · Апскейл (A100): <strong>$0.7276</strong> · PRO 6000 FP8 + тесты 2c (суммарно с отладкой и батчем): <strong>$7.3978</strong> (активных GPU: <code>0</code>)</td>
       </tr>
     </tbody>
   </table>
@@ -547,13 +547,18 @@
       </tr>
       <tr>
         <td><strong>Шаг 2b</strong> — Бенчмарк апскейлеров <code>480p → 736p</code></td>
-        <td><span class="status-done">Готово · 5 GPU + Topaz</span></td>
+        <td><span class="status-done">Готово · 0df58ae</span></td>
         <td>Замеры <code>Real-ESRGAN</code> (x2plus, x4v3), <code>SeedVR2</code> (3B, 7B, 7B Sharp) на <code>A100 SXM4</code>, проверка Topaz API и сравнение с <code>736p</code></td>
       </tr>
       <tr>
-        <td><strong>Шаг 3</strong> — Прогон кейсов Насти + <code>Q8_0</code></td>
-        <td><span class="status-pending">Ожидает роликов Насти</span></td>
-        <td>Тест 5–7 реальных <code>9:16</code> роликов (<code>swap</code>/<code>edit</code>) с лучшим апскейлом и проверка <code>Q8_0</code> на <code>RTX PRO 6000 96GB</code></td>
+        <td><strong>Шаг 2c</strong> — Face Swap, celebrity-тест и <code>RTX PRO 6000 FP8</code></td>
+        <td><span class="status-done">Готово · GPU verified</span></td>
+        <td>Проверка модерации знаменитостей (<code>nano-banana-2</code>/<code>seedream-4-5</code>/<code>flux-2-pro</code>), нативный <code>736p FP8</code> (<code>torchao 0.15.0</code>) на 96GB GPU, <code>GFPGAN v1.4</code> (вкл. 2+ лица с EMA-трекингом)</td>
+      </tr>
+      <tr>
+        <td><strong>Шаг 3</strong> — Серийный прогон боевых роликов + HTTP-воркер</td>
+        <td><span class="status-pending">Следующий этап</span></td>
+        <td>Серия вертикальных роликов заказчика <code>9:16</code> (<code>swap</code>/<code>edit</code>), прогретый демон с <code>FP8</code> в памяти (без 4.4-мин холодной квантизации на каждый ролик)</td>
       </tr>
       <tr>
         <td><strong>Шаг 4</strong> — Сдача PoC и переход в прод</td>
@@ -741,6 +746,122 @@
     1. <strong>Standard / Fast (по умолчанию):</strong> рендер <code>480p</code> + <code>Real-ESRGAN general-x4v3</code> прямо на том же H200/PRO 6000 воркере (всего +11.8 сек и ~0.24 GiB VRAM, не нужен отдельный сервер). Итого <strong>~1.8 мин GPU и ~$0.21 (~21 ₽)</strong> вместо ~6.1 мин и ~$0.63 (~63 ₽) за нативный <code>736p</code> — экономия <strong>3×</strong> при заметно более чёткой одежде и фоне.<br/>
     2. <strong>HQ / Pro (сложные планы лиц и быстрое движение):</strong> <code>480p</code> + <code>SeedVR2-7B Sharp FP8</code> (~<strong>$0.26 / ~26 ₽</strong>; в коде уже убран <code>--prepend_frames 4</code> для 100% синхра звука) либо нативный <code>736p</code> (~63 ₽) для премиум-запросов.<br/>
     3. <strong>Следующий шаг (Шаг 3):</strong> прогнать 5–7 реальных вертикальных клипов <code>9:16</code> от Насти и замерить <code>Q8_0</code> на <code>RTX PRO 6000 96GB</code>.
+  </div>
+
+  <h2 class="page-break">8. Face Swap: модерация знаменитостей, RTX PRO 6000 96GB FP8 и GFPGAN v1.4 (Шаг 2c)</h2>
+  <p>
+    Для режима <code>--mode swap</code> проверены два критичных вопроса: (1) пропускают ли Image-модели провайдера GPUniq замену лица на знаменитость, и (2) помещается ли нативный <code>736p</code> в один дешёвый сервер <code>RTX PRO 6000 Blackwell 96GB</code> (<code>$1.9907/ч</code> — в 2.3× дешевле H200) с помощью <code>torchao 0.15.0 Float8WeightOnlyConfig</code> и коммерчески безопасной постобработки <code>YuNet + GFPGAN v1.4 + Real-ESRGAN general-x4v3</code>.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Image-модель (Шаг 3: покраска рефа)</th>
+        <th>Модерация (имя «Keanu Reeves»)</th>
+        <th>Время / Цена</th>
+        <th>Точность позы, ракурса и сцены (<code>demo_source</code>)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="row-win">
+        <td><strong>nano-banana-2</strong> (по умолчанию)</td>
+        <td><span class="status-done">Прошла с именем</span></td>
+        <td>174.8 с · <strong>$0.0500</strong></td>
+        <td><strong>Выбрана:</strong> идеально сохранила наклон головы вниз, взгляд на руки, кепку, кофту и сырое тесто для пиццы</td>
+      </tr>
+      <tr>
+        <td><strong>seedream-4-5</strong> (1-й фолбэк)</td>
+        <td><span class="status-done">Прошла с именем</span></td>
+        <td>476.9 с · $0.0400</td>
+        <td>Дольше в 2.7×; развернула голову прямо в камеру и превратила тесто в готовую пиццу пепперони</td>
+      </tr>
+      <tr>
+        <td><strong>flux-2-pro</strong> (2-й фолбэк)</td>
+        <td><code>generation_failed</code> (96.6 с)</td>
+        <td>$0.0000 (без списания)</td>
+        <td>Апстрим-ошибка провайдера; каскад автоматически переключен на следующий фолбэк <code>gpt-image-2</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="strip-card">
+    <img src="assets/faceswap_painters_compare.jpg" alt="Сравнение генераторов ключевого кадра для face swap" />
+    <div class="strip-caption">
+      Публичный тест модерации знаменитостей (исходник → <code>nano-banana-2</code> → <code>seedream-4-5</code>): <code>nano-banana-2</code> прошла без цензуры и точнее сохранила геометрию исходной сцены
+    </div>
+  </div>
+
+  <div class="page-break"></div>
+  <h2>9. Замеры Face Swap на RTX PRO 6000 96GB FP8 и сравнение с рынком</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Вариант <code>swap</code> на <code>RTX PRO 6000 WS</code> ($1.9907/ч)</th>
+        <th>Выход</th>
+        <th>Рендер / Пост</th>
+        <th>Пик VRAM</th>
+        <th>Чистая GPU-цена*</th>
+        <th>Визуальный итог (проверено покадрово)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1. <strong>480p FP8</strong> (226 кадров / 9.42 с)</td>
+        <td><code>832×480</code></td>
+        <td><strong>146.5 с</strong> (2.4 мин)</td>
+        <td>50.7 GiB alloc (60.2 res)</td>
+        <td><strong>$0.081</strong> (~8 ₽)</td>
+        <td>Черты узнаваемы, но <code>480p</code> мылит кожу и даёт тёмное пятно под щекой</td>
+      </tr>
+      <tr>
+        <td>2. <strong>480p FP8 + Real-ESRGAN v3 + GFPGAN</strong></td>
+        <td><code>1280×736</code></td>
+        <td>146.5 + <strong>19.8 с</strong> (195/226 лиц)</td>
+        <td>1.08 GiB (пост)</td>
+        <td><strong>$0.092</strong> (~9 ₽)</td>
+        <td>Чёткие глаза, ресницы и ткань кофты, но CNN/GAN закрепляет и подчёркивает артефакт тени 480p на щеке</td>
+      </tr>
+      <tr>
+        <td>3. <strong>Native 736p FP8</strong> (впервые на 96GB!)</td>
+        <td><code>1280×736</code></td>
+        <td><strong>567.9 с</strong> (9.5 мин)</td>
+        <td>62.8 GiB alloc (81.8 res)</td>
+        <td><strong>$0.314</strong> (~31 ₽)</td>
+        <td>Чистая геометрия лица без артефакта 480p; почти в <strong>2× дешевле</strong> нативного 736p на H200 bf16 ($0.57)</td>
+      </tr>
+      <tr class="row-win">
+        <td>4. <strong>Native 736p FP8 + GFPGAN v1.4</strong></td>
+        <td><code>1280×736</code></td>
+        <td>567.9 + <strong>12.3 с</strong> (199/226 лиц)</td>
+        <td>1.04 GiB (пост)</td>
+        <td><strong>$0.321</strong> (~32 ₽)</td>
+        <td><strong>Эталон для Face Swap:</strong> отсутствие блочных теней + естественная детализация кожи, бороды и глаз</td>
+      </tr>
+      <tr>
+        <td>5. <strong>480p FP8 (2 персонажа + 2 одежды, 345 кадров / 14.38 с)</strong> + Multi-Face GFPGAN</td>
+        <td><code>1280×736</code></td>
+        <td>282.7 + <strong>32.4 с</strong> (345/345, 690 лиц)</td>
+        <td>55.5 GiB alloc (70.7 res)</td>
+        <td><strong>$0.174</strong> (~17 ₽)</td>
+        <td>Двойная замена лиц и одежды в ночном авто-селфи (перекрытие рукой, 2 ключевых кадра): стабильный лип-синк и 100% детекция обоих лиц</td>
+      </tr>
+    </tbody>
+  </table>
+  <p style="font-size: 7.7pt; color: #64748b; margin-top: -4px;">
+    * Холодная загрузка и FP8-квантизация трансформатора на PRO 6000 занимает <code>262–266 с</code> (<code>41.2 GiB</code> VRAM) один раз на запуск воркера; в постоянном воркере модель остаётся в VRAM.
+  </p>
+
+  <div class="strip-card">
+    <img src="assets/faceswap_video_compare.jpg" alt="Сравнение 4 вариантов Face Swap на RTX PRO 6000 FP8" />
+    <div class="strip-caption">
+      Покадровый зум (кадр 200 / 8.33s): (1) 480p FP8 → (2) 480p + ESRGAN + GFPGAN → (3) Нативный 736p FP8 → (4) Нативный 736p FP8 + GFPGAN v1.4 (лидер чистоты и детализации лица)
+    </div>
+  </div>
+
+  <div class="callout-info">
+    <strong>Позиционирование против коммерческих движков в проде (статистика LOKI Gen Bot):</strong><br/>
+    • <strong>Genjutsu Motion Transfer:</strong> 480p — медиана 6.6 мин (<strong>25% отказов</strong>); 720p — медиана 8.1 мин, 90% &lt; 14.2 мин (<strong>21% отказов</strong>). Наш <code>MiniMax-H3 + FP8</code> в прогретом воркере рендерит <code>480p</code> за <strong>2.4–4.7 мин</strong> (~8–17 ₽ GPU) с контролируемой детерминистичной логикой и без цензуры на референсы.<br/>
+    • <strong>Wan 3.0 Prime / Seedance 2.5:</strong> Wan — медиана 2.7м / 4.2м (<strong>11% отказов</strong>); Seedance — 5.4м / 6.4м (11% &gt; 10м). Наша связка <code>RTX PRO 6000 96GB + FP8 + GFPGAN v1.4</code> закрывает даже <strong>максимальные 14.4 с (345 кадров)</strong> с заменой нескольких лиц и одежды за <strong>~$0.17</strong> на быстрой дорожке и <strong>~$0.32</strong> в нативном <code>736p + GFPGAN</code>.
   </div>
 
   <div class="footer">

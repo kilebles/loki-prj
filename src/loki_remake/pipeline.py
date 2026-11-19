@@ -27,6 +27,7 @@ def prepare_job(
     tier: RenderTier | None = None,
     max_refs: int = 2,
     out_dir: Path | None = None,
+    paint_model: str | None = None,
     client: GPUniqClient | None = None,
 ) -> PreparedJob:
     """Run normalize -> shot detection -> keyframe painting -> 6-section prompt generation."""
@@ -75,8 +76,9 @@ def prepare_job(
                 pin_frame=pin_frame,
                 fps=float(normalized.fps),
                 user_ref=user_ref_path,
-                model=settings.painter_model,
+                model=paint_model or settings.painter_model,
                 fallback_model=settings.painter_fallback_model,
+                fallback_models=settings.painter_fallback_models,
             )
             painted_refs.append(painted)
         timings["paint"] = round(time.monotonic() - t2, 3)

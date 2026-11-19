@@ -41,10 +41,12 @@ def _build_paint_prompt(mode: RemakeMode, instruction: str, has_user_ref: bool) 
     if mode == "swap":
         if has_user_ref:
             return (
-                f"Edit the first image so the target subject matches the identity, face, hair, "
-                f"and appearance shown in the second reference image. Instruction: {instruction}. "
-                f"Keep the exact same camera angle, framing, pose, body position, lighting, "
-                f"background, and all other people or objects from the first image unchanged."
+                f"Edit the first image so the target subject has the exact facial identity, "
+                f"likeness, eyes, nose, jawline, hair, and facial hair shown in the second "
+                f"reference portrait. Instruction: {instruction}. Naturally match the outdoor "
+                f"or scene lighting direction, color temperature, shadows, and skin tone of "
+                f"the first image. Keep the exact same camera angle, framing, head tilt, body "
+                f"pose, clothing, hands, objects, and background from the first image unchanged."
             )
         return (
             f"Edit the first image according to this instruction: {instruction}. "
@@ -143,22 +145,43 @@ def paint_keyframe(
     pin_frame: int = 0,
     fps: float = 24.0,
     user_ref: Path | None = None,
+    user_refs: list[Path] | None = None,
+    custom_prompt: str | None = None,
     model: str = "nano-banana-2",
     fallback_model: str | None = "gpt-image-2",
+    fallback_models: list[str] | None = None,
     poll_interval_sec: float = 2.5,
     timeout_sec: float = 600.0,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> PaintedRef:
     """Repaint a source keyframe via GPUniq Image Jobs and fit it to the exact target canvas."""
-    prompt = _build_paint_prompt(mode, instruction, has_user_ref=user_ref is not None)
-    input_images = [encode_image_data_url(source_frame)]
-    if user_ref is not None:
-        input_images.append(encode_image_data_url(user_ref))
+    refs: list[Path] = []
+    if user_refs:
+        refs.extend(user_refs)
+    elif user_ref is not None:
+        refs.append(user_ref)
 
-    attempts: list[str] = [model]
-    if fallback_model and fallback_model != model:
-        attempts.append(fallback_model)
-    else:
+    prompt = (
+        custom_prompt
+        if custom_prompt is not None
+        else _build_paint_prompt(mode, instruction, has_user_ref=bool(refs))
+    )
+    input_images = [encode_image_data_url(source_frame)]
+    for ref_path in refs:
+        input_images.append(encode_image_data_url(ref_path))
+
+    candidates = [model]
+    if fallback_models:
+        candidates.extend(fallback_models)
+    elif fallback_model:
+        candidates.append(fallback_model)
+
+    attempts: list[str] = []
+    for m in candidates:
+        if m and m not in attempts:
+            attempts.append(m)
+    if len(attempts) == 1:
+        # Retry transient failures once if no distinct fallback model was configured.
         attempts.append(model)
 
     last_err: Exception | None = None

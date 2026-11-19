@@ -21,6 +21,7 @@ from loki_remake.gpuniq.ops import (
     extract_ssh_connection,
     load_active_gpu,
     pick_best_h200,
+    rank_pro6000_gpus,
     rank_upscaler_gpus,
     rsync_from_remote,
     rsync_to_remote,
@@ -126,6 +127,9 @@ def prepare(
     ref: Annotated[Path | None, typer.Option(exists=True, help="Optional reference image")] = None,
     tier: Annotated[RenderTier, typer.Option(help="Canvas short edge: 480 or 736")] = 480,
     max_refs: Annotated[int, typer.Option(min=1, max=4, help="Max keyframes to paint")] = 2,
+    paint_model: Annotated[
+        str | None, typer.Option(help="Override painter image model slug")
+    ] = None,
     out: Annotated[Path | None, typer.Option(help="Output job directory")] = None,
 ) -> None:
     """Normalize video, extract shots/keyframes, paint refs, and build MiniMax-H3 prompt."""
@@ -141,6 +145,7 @@ def prepare(
         tier=tier,
         max_refs=max_refs,
         out_dir=out,
+        paint_model=paint_model,
     )
 
     console.print(f"[green]Prepared job {job.job_id}[/green]")
@@ -237,14 +242,17 @@ def gpu_offers(
 def gpu_up(
     agent_id: Annotated[int | None, typer.Option(help="Explicit Marketplace agent_id")] = None,
     auto_h200: Annotated[bool, typer.Option(help="Auto-select best fast 1x H200 offer")] = False,
+    auto_pro6000: Annotated[
+        bool, typer.Option(help="Auto-select best fast 1x RTX PRO 6000 96GB offer")
+    ] = False,
     disk: Annotated[int, typer.Option(help="Container disk size in GB")] = 250,
 ) -> None:
     """Rent a 1x GPU on GPUniq Marketplace with minute billing and wait for SSH."""
     settings = get_settings()
     _configure_logging(settings.log_level)
 
-    if agent_id is None and not auto_h200:
-        console.print("[red]Pass either --agent-id <ID> or --auto-h200[/red]")
+    if agent_id is None and not auto_h200 and not auto_pro6000:
+        console.print("[red]Pass --agent-id <ID>, --auto-h200, or --auto-pro6000[/red]")
         raise typer.Exit(code=2)
 
     priv_key = Path.home() / ".ssh" / "id_ed25519"
@@ -252,28 +260,47 @@ def gpu_up(
 
     with _client_from_settings() as client:
         ssh_key_id = ensure_ssh_key(client, pubkey_path=pub_key)
-        if agent_id is None:
-            offer = pick_best_h200(client, min_disk_gb=max(250.0, float(disk)))
-            selected_id = int(offer["id"])
+        min_disk = max(250.0, float(disk))
+        if agent_id is not None:
+            candidates = [client.get_agent(agent_id)]
+        elif auto_pro6000:
+            candidates = rank_pro6000_gpus(client, min_disk_gb=max(280.0, float(disk)))
         else:
-            offer = client.get_agent(agent_id)
-            selected_id = agent_id
+            candidates = [pick_best_h200(client, min_disk_gb=min_disk)]
 
-        gpu_model = str(offer.get("gpu_model") or "H200")
-        price_hr = float(offer.get("price_per_hour") or 0.0)
-        console.print(
-            f"Ordering agent_id={selected_id} ({gpu_model}, "
-            f"{offer.get('ram_gb')}GB RAM, {offer.get('down_mbps')} Mbps) at ${price_hr:.4f}/hr"
-        )
+        order: dict[str, object] | None = None
+        selected_offer: dict[str, object] | None = None
+        last_err: Exception | None = None
+        for offer in candidates:
+            selected_id = int(offer["id"])
+            gpu_model = str(offer.get("gpu_model") or "GPU")
+            price_hr = float(offer.get("price_per_hour") or 0.0)
+            console.print(
+                f"Ordering agent_id={selected_id} ({gpu_model}, "
+                f"{offer.get('ram_gb')}GB RAM, {offer.get('down_mbps')} Mbps) at ${price_hr:.4f}/hr"
+            )
+            try:
+                order = client.create_marketplace_order(
+                    agent_id=selected_id,
+                    gpu_required=1,
+                    pricing_type="minute",
+                    docker_image="vastai/pytorch:cuda-12.9.1-auto",
+                    ssh_key_ids=[ssh_key_id],
+                    disk_gb=disk,
+                )
+                selected_offer = offer
+                break
+            except GPUniqAPIError as exc:
+                last_err = exc
+                console.print(f"[yellow]Offer agent_id={selected_id} skipped: {exc}[/yellow]")
+                continue
 
-        order = client.create_marketplace_order(
-            agent_id=selected_id,
-            gpu_required=1,
-            pricing_type="minute",
-            docker_image="vastai/pytorch:cuda-12.9.1-auto",
-            ssh_key_ids=[ssh_key_id],
-            disk_gb=disk,
-        )
+        if order is None or selected_offer is None:
+            raise RuntimeError(f"All GPU order attempts failed: {last_err}")
+
+        selected_id = int(selected_offer["id"])
+        gpu_model = str(selected_offer.get("gpu_model") or "GPU")
+        price_hr = float(selected_offer.get("price_per_hour") or 0.0)
         raw_task = (
             order.get("order_id")
             or order.get("task_id")
@@ -367,6 +394,8 @@ def gpu_setup() -> None:
         state.ssh_key_path,
         "chmod +x /tmp/setup_gpu.sh && bash /tmp/setup_gpu.sh",
         stream=True,
+        timeout=1080.0,
+        idle_timeout=180.0,
     )
     if rc != 0:
         console.print(f"[red]gpu-setup failed with exit code {rc}[/red]")

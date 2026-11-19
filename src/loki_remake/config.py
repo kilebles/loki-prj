@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     gpuniq_base_url: str = "https://api.gpuniq.com"
     painter_model: str = "nano-banana-2"
     painter_fallback_model: str | None = "gpt-image-2"
+    painter_fallback_models: list[str] = Field(
+        default_factory=lambda: ["seedream-4-5", "flux-2-pro", "gpt-image-2"]
+    )
     vlm_model: str = "gemini-3-flash"
     default_tier: Literal[480, 736] = 480
     work_dir: Path = Path("work")

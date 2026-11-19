@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 from pathlib import Path
 
 from PIL import Image
 from pytest_httpx import HTTPXMock
 
 from loki_remake.gpuniq.client import GPUniqClient
-from loki_remake.gpuniq.ops import extract_ssh_connection, pick_best_h200
+from loki_remake.gpuniq.ops import extract_ssh_connection, pick_best_h200, rank_pro6000_gpus
 from loki_remake.gpuniq.painter import paint_keyframe
 from loki_remake.gpuniq.prompter import generate_minimax_prompt
 from loki_remake.schemas import NormalizedVideo, PaintedRef, ShotInfo
@@ -312,3 +313,183 @@ def test_extract_ssh_connection_variants() -> None:
             }
         }
     ) == ("207.148.106.151", 43499, "root")
+
+
+def test_painter_multi_model_cascade(httpx_mock: HTTPXMock, tmp_path: Path) -> None:
+    src_frame = _make_png(tmp_path / "src.png")
+    user_ref = _make_png(tmp_path / "celeb.png", color=(20, 200, 20))
+    out_path = tmp_path / "painted.png"
+
+    # Attempt 1: nano-banana-2 rejected by content_moderation
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.gpuniq.com/v1/llm/images/jobs",
+        json={"exception": 0, "data": {"job_id": "job_nb"}},
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url="https://api.gpuniq.com/v1/llm/images/jobs/job_nb",
+        json={
+            "exception": 0,
+            "data": {"status": "failed", "error_code": "content_moderation", "error": "Celebrity"},
+        },
+    )
+    # Attempt 2: seedream-4-5 succeeds
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.gpuniq.com/v1/llm/images/jobs",
+        json={"exception": 0, "data": {"job_id": "job_sd"}},
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url="https://api.gpuniq.com/v1/llm/images/jobs/job_sd",
+        json={
+            "exception": 0,
+            "data": {
+                "status": "completed",
+                "cost_usd": 0.04,
+                "image": {"b64_json": _png_b64((512, 896))},
+            },
+        },
+    )
+
+    with GPUniqClient(api_key="gpuniq_test") as client:
+        ref = paint_keyframe(
+            client,
+            source_frame=src_frame,
+            mode="swap",
+            instruction="Swap face",
+            aspect_ratio="9:16",
+            target_size=(480, 832),
+            out_path=out_path,
+            user_ref=user_ref,
+            model="nano-banana-2",
+            fallback_models=["seedream-4-5", "flux-2-pro", "gpt-image-2"],
+            poll_interval_sec=0.0,
+            sleep_fn=lambda _: None,
+        )
+
+    assert ref.model_used == "seedream-4-5"
+    assert ref.cost_usd == 0.04
+    assert out_path.exists()
+
+
+def test_rank_pro6000_gpus(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        method="GET",
+        url="https://api.gpuniq.com/v1/marketplace/list?sort_by=price-low&page=1&page_size=25&gpu_model=RTX+PRO+6000&gpu_model=RTX+PRO+6000+S&gpu_model=RTX+PRO+6000+WS&gpu_model=RTX+PRO+6000+Max-Q&gpu_model=RTX+PRO+6000+Blackwell&min_vram_gb=90.0&min_ram_gb=150.0&min_disk_gb=280.0&min_inet_speed_mbps=500.0&max_price_per_hour=3.0&max_gpu_count=1&provider=vast",
+        json={
+            "exception": 0,
+            "data": {
+                "agents": [
+                    {
+                        "id": 100,
+                        "gpu_model": "RTX PRO 6000 Max-Q",
+                        "gpu_count": 1,
+                        "status": "online",
+                        "instances_available": 1,
+                        "vram_gb": 95,
+                        "ram_gb": 188,
+                        "storage_gb": 500,
+                        "down_mbps": 900,
+                        "reliability": 0.99,
+                        "cuda_max_good": 13.0,
+                        "price_per_hour": 2.0,
+                    },
+                    {
+                        "id": 101,
+                        "gpu_model": "RTX PRO 6000 S",
+                        "gpu_count": 1,
+                        "status": "online",
+                        "instances_available": 1,
+                        "vram_gb": 95,
+                        "ram_gb": 251,
+                        "storage_gb": 900,
+                        "down_mbps": 1850,
+                        "reliability": 0.993,
+                        "cuda_max_good": 13.2,
+                        "price_per_hour": 2.26,
+                    },
+                ]
+            },
+        },
+    )
+
+    with GPUniqClient(api_key="gpuniq_test") as client:
+        ranked = rank_pro6000_gpus(client)
+    assert [a["id"] for a in ranked] == [101, 100]
+
+
+def test_painter_multi_user_refs_and_custom_prompt(
+    httpx_mock: HTTPXMock, tmp_path: Path
+) -> None:
+    src_frame = tmp_path / "src.png"
+    ref_a = tmp_path / "ref_a.png"
+    ref_b = tmp_path / "ref_b.png"
+    out_path = tmp_path / "painted.png"
+    for idx, p in enumerate((src_frame, ref_a, ref_b)):
+        Image.new("RGB", (64, 64), (30 * idx + 10, 50, 90)).save(p)
+
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.gpuniq.com/v1/llm/images/jobs",
+        json={"exception": 0, "data": {"job_id": "job_multi_1"}},
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url="https://api.gpuniq.com/v1/llm/images/jobs/job_multi_1",
+        json={
+            "exception": 0,
+            "data": {
+                "status": "completed",
+                "cost_usd": 0.05,
+                "image": {"b64_json": _png_b64((512, 288))},
+            },
+        },
+    )
+
+    with GPUniqClient(api_key="gpuniq_test") as client:
+        painted = paint_keyframe(
+            client,
+            source_frame=src_frame,
+            mode="swap",
+            instruction="Swap both",
+            aspect_ratio="16:9",
+            target_size=(1280, 736),
+            out_path=out_path,
+            user_refs=[ref_a, ref_b],
+            custom_prompt="Explicit Image 1/2/3 prompt",
+            poll_interval_sec=0.0,
+            sleep_fn=lambda _: None,
+        )
+
+    post_req = httpx_mock.get_requests()[0]
+    payload = json.loads(post_req.content.decode("utf-8"))
+    assert payload["prompt"] == "Explicit Image 1/2/3 prompt"
+    assert len(payload["input_images"]) == 3
+    assert painted.cost_usd == 0.05
+    assert Image.open(out_path).size == (1280, 736)
+
+
+def test_run_ssh_idle_timeout(monkeypatch, tmp_path: Path) -> None:
+    import sys
+
+    import pytest
+
+    from loki_remake.gpuniq import ops
+
+    monkeypatch.setattr(
+        ops,
+        "_ssh_base_args",
+        lambda _k, _p: [sys.executable, "-c", "import sys; exec(sys.argv[2])"],
+    )
+    with pytest.raises(TimeoutError, match="no output"):
+        ops.run_ssh(
+            "ignored",
+            22,
+            "root",
+            tmp_path / "id_ed25519",
+            "import time; time.sleep(5)",
+            stream=True,
+            idle_timeout=0.3,
+        )

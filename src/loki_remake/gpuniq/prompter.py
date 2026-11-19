@@ -274,7 +274,7 @@ def generate_minimax_prompt(
             "model": vlm_model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         }
     )
     total_cost += _extract_cost(resp)
@@ -306,7 +306,7 @@ def generate_minimax_prompt(
             "model": vlm_model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         }
     )
     total_cost += _extract_cost(resp_fix)

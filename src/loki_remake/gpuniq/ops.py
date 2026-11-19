@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import re
+import selectors
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -224,6 +227,59 @@ def pick_best_upscaler_gpu(
     )[0]
 
 
+def rank_pro6000_gpus(
+    client: GPUniqClient,
+    *,
+    min_vram_gb: float = 90.0,
+    min_ram_gb: float = 150.0,
+    min_disk_gb: float = 280.0,
+    min_down_mbps: float = 500.0,
+    min_reliability: float = 0.95,
+    max_price: float = 3.0,
+) -> list[dict[str, Any]]:
+    """Select ranked reliable 1x RTX PRO 6000 96GB offers with >=150GB RAM for FP8 rendering."""
+    resp = client.list_marketplace(
+        gpu_model=[
+            "RTX PRO 6000",
+            "RTX PRO 6000 S",
+            "RTX PRO 6000 WS",
+            "RTX PRO 6000 Max-Q",
+            "RTX PRO 6000 Blackwell",
+        ],
+        max_gpu_count=1,
+        min_vram_gb=min_vram_gb,
+        min_ram_gb=min_ram_gb,
+        min_disk_gb=min_disk_gb,
+        min_inet_speed_mbps=min_down_mbps,
+        max_price_per_hour=max_price,
+        provider="vast",
+        sort_by="price-low",
+        page_size=25,
+    )
+    candidates = _filter_gpu_candidates(
+        resp.get("agents", []),
+        min_reliability=min_reliability,
+        min_vram_gb=min_vram_gb,
+        min_ram_gb=min_ram_gb,
+        min_disk_gb=min_disk_gb,
+        min_cuda=12.8,
+    )
+    if candidates:
+        return sorted(
+            candidates,
+            key=lambda a: (
+                0 if float(a.get("down_mbps") or 0) >= 1500.0 else 1,
+                float(a.get("price_per_hour") or 999.0),
+                -float(a.get("down_mbps") or 0.0),
+            ),
+        )
+
+    raise RuntimeError(
+        "No matching 1x RTX PRO 6000 96GB offer found on GPUniq Marketplace "
+        f"(RAM>={min_ram_gb}GB, disk>={min_disk_gb}GB, max_price=${max_price}/h)"
+    )
+
+
 def extract_ssh_connection(instance_data: dict[str, Any]) -> tuple[str | None, int | None, str]:
     """Extract (host, port, user) from GPUniq instance metadata."""
     containers: list[dict[str, Any]] = [instance_data]
@@ -336,8 +392,9 @@ def run_ssh(
     *,
     stream: bool = True,
     timeout: float | None = None,
+    idle_timeout: float | None = None,
 ) -> tuple[int, str]:
-    """Execute a shell command over SSH, optionally streaming output live."""
+    """Execute a shell command over SSH with optional wall-clock and idle watchdogs."""
     cmd = [*_ssh_base_args(key_path, port), f"{user}@{host}", command]
     if not stream:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
@@ -347,16 +404,66 @@ def run_ssh(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
     )
-    lines: list[str] = []
     assert proc_p.stdout is not None
-    for line in proc_p.stdout:
-        print(line, end="", flush=True)
-        lines.append(line)
-    rc = proc_p.wait(timeout=timeout)
-    return rc, "".join(lines)
+    fd = proc_p.stdout.fileno()
+    sel = selectors.DefaultSelector()
+    sel.register(fd, selectors.EVENT_READ)
+    chunks: list[str] = []
+    start = time.monotonic()
+    last_activity = start
+
+    try:
+        while True:
+            now = time.monotonic()
+            remaining: list[float] = []
+            if timeout is not None:
+                remaining.append(max(0.0, timeout - (now - start)))
+            if idle_timeout is not None:
+                remaining.append(max(0.0, idle_timeout - (now - last_activity)))
+            wait_sec = min(1.0, *remaining) if remaining else 1.0
+
+            events = sel.select(timeout=wait_sec)
+            now = time.monotonic()
+            if events:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                last_activity = now
+                text = data.decode("utf-8", errors="replace")
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                chunks.append(text)
+                continue
+
+            if timeout is not None and (now - start) > timeout:
+                proc_p.kill()
+                proc_p.wait()
+                raise TimeoutError(f"SSH command exceeded wall timeout ({timeout}s)")
+            if idle_timeout is not None and (now - last_activity) > idle_timeout:
+                proc_p.kill()
+                proc_p.wait()
+                raise TimeoutError(
+                    f"SSH command produced no output for {idle_timeout}s"
+                )
+            if proc_p.poll() is not None:
+                # Drain any buffered bytes after child exits.
+                while True:
+                    tail = os.read(fd, 4096)
+                    if not tail:
+                        break
+                    text = tail.decode("utf-8", errors="replace")
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                    chunks.append(text)
+                break
+    finally:
+        sel.close()
+        proc_p.stdout.close()
+
+    wait_left = None if timeout is None else max(1.0, timeout - (time.monotonic() - start))
+    rc = proc_p.wait(timeout=wait_left)
+    return rc, "".join(chunks)
 
 
 def rsync_to_remote(
