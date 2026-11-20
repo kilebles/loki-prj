@@ -91,8 +91,11 @@ def test_compare_face_scale_and_letterbox_safe_remap(monkeypatch, tmp_path: Path
     assert report is not None
     assert report.normalized_applied is True
     assert out_bgr.shape == painted_bgr.shape
-    assert np.array_equal(out_bgr[:30], painted_bgr[:30])
-    assert np.array_equal(out_bgr[210:], painted_bgr[210:])
+    assert np.array_equal(out_bgr[:30], src_bgr[:30])
+    assert np.array_equal(out_bgr[210:], src_bgr[210:])
+    # Outside subject (all probs[:,:,0]==1.0), exact source BG is preserved pixel-for-pixel.
+    assert np.array_equal(out_bgr[:, :40], src_bgr[:, :40])
+    assert np.array_equal(out_bgr[:, 280:], src_bgr[:, 280:])
 
 
 def test_painter_scale_lock_retry_and_fallback(
@@ -137,16 +140,17 @@ def test_painter_scale_lock_retry_and_fallback(
 
     def fake_cmp(*_args, **_kwargs):
         calls["cmp"] += 1
-        return rep_1 if calls["cmp"] == 1 else rep_2
+        if calls["cmp"] == 1:
+            return rep_1
+        if calls["cmp"] == 2:
+            return rep_2
+        return rep_3
 
     qc_paths = (tmp_path / "y.onnx", tmp_path / "s.tflite")
     monkeypatch.setattr(painter, "_load_qc_models", lambda _d: qc_paths)
+    monkeypatch.setattr(painter, "align_painted_to_source_bg", lambda _s, p, _t: (p, 0.88))
     monkeypatch.setattr(painter, "compare_face_scale", fake_cmp)
-    monkeypatch.setattr(
-        painter,
-        "normalize_head_scale",
-        lambda _s, p_bgr, **_kw: (p_bgr, rep_3),
-    )
+    monkeypatch.setattr(painter, "lock_background_to_source", lambda _s, a, _t, _y: a)
 
     with GPUniqClient(api_key="gpuniq_test") as client:
         painted = painter.paint_keyframe(
@@ -193,6 +197,40 @@ def test_face_enhance_lab_and_grain_helpers() -> None:
     grained = _reinject_luminance_grain(src, np.full((128, 128, 3), 128, dtype=np.uint8), 0.5)
     assert grained.dtype == np.uint8
     assert float(grained.std()) > 0.5
+
+
+def test_face_enhance_umeyama_and_track_smoothing() -> None:
+    infra_dir = str(Path(__file__).resolve().parents[1] / "infra")
+    if infra_dir not in sys.path:
+        sys.path.insert(0, infra_dir)
+    from face_enhance import _FFHQ_TEMPLATE_512, _smooth_track_landmarks, _umeyama_similarity_2d
+
+    # Known 12-deg rotation, 0.5x scale, (+20, -10) shift -> recovered accurately via Umeyama.
+    theta = np.deg2rad(12.0)
+    sc = 0.5
+    true_m = np.array(
+        [
+            [sc * np.cos(theta), -sc * np.sin(theta), 20.0],
+            [sc * np.sin(theta), sc * np.cos(theta), -10.0],
+        ],
+        dtype=np.float64,
+    )
+    dst_h = np.hstack([_FFHQ_TEMPLATE_512, np.ones((5, 1))]) @ true_m.T
+    est_m = _umeyama_similarity_2d(_FFHQ_TEMPLATE_512, dst_h)
+    assert np.allclose(est_m, true_m, atol=1e-4)
+
+    # Smooth track gap interpolation + single-frame outlier damping.
+    obs = []
+    for f in (0, 1, 2, 5, 6, 7):
+        pts = _FFHQ_TEMPLATE_512 * 0.5 + np.array([float(f), 0.0], dtype=np.float32)
+        if f == 5:
+            pts[0, 0] += 90.0  # synthetic detector glitch
+        obs.append((f, pts, 4000.0))
+
+    smoothed = _smooth_track_landmarks(obs, shot_start=0, shot_end=7, max_gap=5, min_len=4)
+    assert set(smoothed.keys()) == {0, 1, 2, 3, 4, 5, 6, 7}
+    # Outlier at f=5 should be pulled close to true linear trajectory (~+5px, not +90px).
+    assert abs(float(smoothed[5][0][0, 0] - (_FFHQ_TEMPLATE_512[0, 0] * 0.5 + 5.0))) < 5.0
 
 
 def test_cli_help_includes_new_flags() -> None:

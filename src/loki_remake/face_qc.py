@@ -1,4 +1,4 @@
-"""Keyframe face scale verification, semantic segmentation, and geometric head normalization."""
+"""Keyframe face scale verification, rigid BG alignment, and zero-BG-warp normalization."""
 
 from __future__ import annotations
 
@@ -72,6 +72,29 @@ def ensure_local_aux_models(cache_dir: Path = Path("work/.models")) -> tuple[Pat
         SELFIE_SEG_URL, cache_dir / "selfie_multiclass_256x256.tflite"
     )
     return yunet_path, tflite_path
+
+
+def detect_letterbox_bars(bgr: np.ndarray, threshold: float = 10.0) -> tuple[int, int]:
+    """Detect contiguous black letterbox row bounds (top_bar, bot_bar)."""
+    h = bgr.shape[0]
+    means = bgr.mean(axis=(1, 2))
+    top = 0
+    while top < h // 3 and float(means[top]) < threshold:
+        top += 1
+    bot = h
+    while bot > (2 * h) // 3 and float(means[bot - 1]) < threshold:
+        bot -= 1
+    return top, bot
+
+
+def _restore_letterbox(out_bgr: np.ndarray, src_bgr: np.ndarray) -> np.ndarray:
+    top_bar, bot_bar = detect_letterbox_bars(src_bgr)
+    h = src_bgr.shape[0]
+    if top_bar > 0:
+        out_bgr[:top_bar] = src_bgr[:top_bar]
+    if bot_bar < h:
+        out_bgr[bot_bar:] = src_bgr[bot_bar:]
+    return out_bgr
 
 
 def detect_faces_yunet(
@@ -173,7 +196,7 @@ def segment_multiclass(img_bgr: np.ndarray, tflite_path: Path) -> np.ndarray:
     with _LOCK:
         interp = _SEG_CACHE.get(key)
         if interp is None:
-            interp = Interpreter(model_path=key)
+            interp = Interpreter(model_path=key, num_threads=4)
             interp.allocate_tensors()
             _SEG_CACHE[key] = interp
 
@@ -204,6 +227,158 @@ def segment_multiclass(img_bgr: np.ndarray, tflite_path: Path) -> np.ndarray:
     return np.clip(probs, 0.0, 1.0).astype(np.float32)
 
 
+def align_painted_to_source_bg(
+    src_bgr: np.ndarray,
+    painted_bgr: np.ndarray,
+    tflite_path: Path,
+) -> tuple[np.ndarray, float]:
+    """Rigidly undo any full-frame painter zoom/shift/letterbox strip via SIFT on background."""
+    h, w = src_bgr.shape[:2]
+    src_top, src_bot = detect_letterbox_bars(src_bgr)
+    p_top, p_bot = detect_letterbox_bars(painted_bgr)
+
+    src_probs = segment_multiclass(src_bgr, tflite_path)
+    p_probs = segment_multiclass(painted_bgr, tflite_path)
+
+    src_bg = (src_probs[:, :, 0] > 0.55).astype(np.uint8) * 255
+    p_bg = (p_probs[:, :, 0] > 0.55).astype(np.uint8) * 255
+    if src_top > 0:
+        src_bg[:src_top] = 0
+    if src_bot < h:
+        src_bg[src_bot:] = 0
+    if p_top > 0:
+        p_bg[:p_top] = 0
+    if p_bot < h:
+        p_bg[p_bot:] = 0
+
+    sift = cv2.SIFT_create(1500)
+    kp1, des1 = sift.detectAndCompute(cv2.cvtColor(src_bgr, cv2.COLOR_BGR2GRAY), src_bg)
+    kp2, des2 = sift.detectAndCompute(cv2.cvtColor(painted_bgr, cv2.COLOR_BGR2GRAY), p_bg)
+    if des1 is None or des2 is None or len(kp1) < 12 or len(kp2) < 12:
+        return _restore_letterbox(painted_bgr.copy(), src_bgr), 1.0
+
+    matches = cv2.BFMatcher().knnMatch(des1, des2, k=2)
+    good = [
+        m
+        for pair in matches
+        if len(pair) == 2
+        for m, n in [pair]
+        if m.distance < 0.72 * n.distance
+    ]
+    if len(good) < 15:
+        return _restore_letterbox(painted_bgr.copy(), src_bgr), 1.0
+
+    pts_src = np.float32([kp1[m.queryIdx].pt for m in good])
+    pts_p = np.float32([kp2[m.trainIdx].pt for m in good])
+    affine, inliers = cv2.estimateAffinePartial2D(
+        pts_p, pts_src, method=cv2.RANSAC, ransacReprojThreshold=3.0
+    )
+    if affine is None or inliers is None or int(inliers.sum()) < 15:
+        return _restore_letterbox(painted_bgr.copy(), src_bgr), 1.0
+
+    scale = float(np.hypot(affine[0, 0], affine[0, 1]))
+    if not (0.75 <= scale <= 1.32):
+        return _restore_letterbox(painted_bgr.copy(), src_bgr), 1.0
+
+    aligned = cv2.warpAffine(
+        painted_bgr,
+        affine,
+        (w, h),
+        flags=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    valid = cv2.warpAffine(
+        np.full((h, w), 255, dtype=np.uint8),
+        affine,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    aligned[valid == 0] = src_bgr[valid == 0]
+    _restore_letterbox(aligned, src_bgr)
+
+    bg_eval = src_bg > 0
+    if int(bg_eval.sum()) > 100:
+        mae_before = float(
+            np.abs(painted_bgr.astype(np.float32) - src_bgr.astype(np.float32))[bg_eval].mean()
+        )
+        mae_after = float(
+            np.abs(aligned.astype(np.float32) - src_bgr.astype(np.float32))[bg_eval].mean()
+        )
+        if mae_after > mae_before + 1.0:
+            return _restore_letterbox(painted_bgr.copy(), src_bgr), 1.0
+
+    return aligned, scale
+
+
+def lock_background_to_source(
+    src_bgr: np.ndarray,
+    aligned_painted_bgr: np.ndarray,
+    tflite_path: Path,
+    yunet_path: Path,
+) -> np.ndarray:
+    """Lock non-subject BG, bystanders, and popped collars to exact source pixels."""
+    h, w = src_bgr.shape[:2]
+    src_faces = detect_faces_yunet(src_bgr, yunet_path)
+    if not src_faces:
+        return _restore_letterbox(aligned_painted_bgr.copy(), src_bgr)
+
+    sf = src_faces[0]
+    src_probs = segment_multiclass(src_bgr, tflite_path)
+    aln_probs = segment_multiclass(aligned_painted_bgr, tflite_path)
+
+    # Head + hair + neck classes only (1=hair, 2=body_skin/neck, 3=face_skin).
+    s_head = np.clip(src_probs[:, :, 1] + src_probs[:, :, 2] + src_probs[:, :, 3], 0.0, 1.0)
+    p_head = np.clip(aln_probs[:, :, 1] + aln_probs[:, :, 2] + aln_probs[:, :, 3], 0.0, 1.0)
+    union_head = (np.maximum(s_head, p_head) > 0.25).astype(np.uint8)
+
+    # Keep only connected component attached to primary face center (never grabs bystanders).
+    _, labels = cv2.connectedComponents(union_head)
+    cx = int(np.clip(round(sf.bbox[0] + sf.bbox[2] * 0.5), 0, w - 1))
+    cy = int(np.clip(round(sf.bbox[1] + sf.bbox[3] * 0.5), 0, h - 1))
+    target_lbl = int(labels[cy, cx])
+    head_cc = (labels == target_lbl).astype(np.uint8) if target_lbl > 0 else union_head
+
+    # Explicitly exclude bounding boxes of any secondary detected faces.
+    for other in src_faces[1:]:
+        ox, oy, ow, oh = other.bbox
+        x1, y1 = max(0, int(ox - ow * 0.5)), max(0, int(oy - oh * 0.6))
+        x2, y2 = min(w, int(ox + ow * 1.5)), min(h, int(oy + oh * 1.6))
+        head_cc[y1:y2, x1:x2] = 0
+
+    fy, fh = sf.bbox[1], sf.bbox[3]
+    head_cc[int(min(h, fy + fh * 1.55)) :, :] = 0
+
+    dil_k = max(11, (int(sf.bbox[2] * 0.12) | 1))
+    dil_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_k, dil_k))
+    head_dil = cv2.dilate(head_cc, dil_kernel).astype(np.float32)
+
+    # Blur FIRST for smooth hair-to-sky transition, THEN apply crisp 3px collar guard below chin.
+    blur_k = max(9, (int(sf.bbox[2] * 0.10) | 1))
+    hair_alpha = np.clip(cv2.GaussianBlur(head_dil, (blur_k, blur_k), 0), 0.0, 1.0)
+
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    below_nose = np.clip((yy - (fy + fh * 0.55)) / max(fh * 0.15, 6.0), 0.0, 1.0)
+    clothes_bin = (src_probs[:, :, 4] > 0.30).astype(np.uint8)
+    clothes_dil = cv2.dilate(clothes_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    clothes_sharp = cv2.GaussianBlur(
+        np.maximum(np.clip(src_probs[:, :, 4] * 1.3, 0.0, 1.0), clothes_dil.astype(np.float32)),
+        (5, 5),
+        0,
+    )
+    alpha = np.clip(hair_alpha * (1.0 - clothes_sharp * below_nose), 0.0, 1.0)[:, :, None]
+
+    out_bgr = np.clip(
+        aligned_painted_bgr.astype(np.float32) * alpha
+        + src_bgr.astype(np.float32) * (1.0 - alpha),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    return _restore_letterbox(out_bgr, src_bgr)
+
+
 def normalize_head_scale(
     src_bgr: np.ndarray,
     painted_bgr: np.ndarray,
@@ -211,119 +386,24 @@ def normalize_head_scale(
     yunet_path: Path,
     tflite_path: Path,
     keep_hair: bool = False,
-    scale_tol: float = 0.07,
+    scale_tol: float = 0.09,
 ) -> tuple[np.ndarray, ScaleReport | None]:
-    """Deterministically rescale painted head to match source actor skull & eye scale."""
-    del keep_hair  # Continuous local warp keeps clothes/neck anchored regardless of hair mode.
-    report = compare_face_scale(src_bgr, painted_bgr, yunet_path, scale_tol=scale_tol)
-    if report is None or report.within_tolerance:
-        return painted_bgr, report
-
-    h, w = painted_bgr.shape[:2]
-    src_face = report.src_face
-    painted_face = report.painted_face
-
-    scale = float(np.clip(1.0 / max(report.scale_ratio, 1e-3), 0.76, 1.30))
-    px = float(np.mean(painted_face.lm5[:, 0]))
-    py = painted_face.eye_center[1] + painted_face.bbox[3] * 0.05
-    sx = float(np.mean(src_face.lm5[:, 0]))
-    sy = src_face.eye_center[1] + src_face.bbox[3] * 0.05
-
-    probs = segment_multiclass(painted_bgr, tflite_path)
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-
-    rx = max(painted_face.bbox[2] * 0.95, 24.0)
-    ry = max(painted_face.bbox[3] * 1.15, 24.0)
-    dist = np.sqrt(((xx - sx) / rx) ** 2 + ((yy - sy) / ry) ** 2)
-    t = np.clip((dist - 0.85) / (2.0 - 0.85), 0.0, 1.0)
-    radial_w = 1.0 - (t * t * (3.0 - 2.0 * t))
-
-    blur_k = max(9, (int(painted_face.bbox[2] * 0.10) | 1))
-    clothes_blur = cv2.GaussianBlur(probs[:, :, 4], (blur_k, blur_k), 0)
-
-    # Detect contiguous black letterbox bars on BOTH painted and source frames.
-    def _letterbox_bounds(bgr: np.ndarray) -> tuple[int, int]:
-        means = bgr.mean(axis=(1, 2))
-        top = 0
-        while top < h // 3 and float(means[top]) < 10.0:
-            top += 1
-        bot = h
-        while bot > (2 * h) // 3 and float(means[bot - 1]) < 10.0:
-            bot -= 1
-        return top, bot
-
-    top_bar, bot_bar = _letterbox_bounds(painted_bgr)
-    src_top_bar, src_bot_bar = _letterbox_bounds(src_bgr)
-
-    y_min = float(top_bar + 4) if top_bar > 0 else 0.0
-    y_max = float(bot_bar - 5) if bot_bar < h else float(h - 1)
-    row_active = np.ones((h, 1), dtype=np.float32)
-    eff_top = max(top_bar, src_top_bar)
-    eff_bot = min(bot_bar, src_bot_bar)
-    if eff_top > 0:
-        row_active[:eff_top, :] = 0.0
-    if eff_bot < h:
-        row_active[eff_bot:, :] = 0.0
-
-    chin_y = painted_face.bbox[1] + painted_face.bbox[3] * 1.20
-    chest_t = np.clip((yy - chin_y) / max(painted_face.bbox[3] * 0.55, 16.0), 0.0, 1.0)
-    upper_body_guard = 1.0 - (chest_t * chest_t * (3.0 - 2.0 * chest_t))
-
-    w_field = np.clip(
-        radial_w * (1.0 - np.clip(clothes_blur * 1.3, 0.0, 1.0)) * upper_body_guard * row_active,
-        0.0,
-        1.0,
-    )
-
-    inv_s = 1.0 / scale
-    raw_map_y = yy + w_field * ((py + (yy - sy) * inv_s) - yy)
-    map_x = np.clip(xx + w_field * ((px + (xx - sx) * inv_s) - xx), 0.0, float(w - 1))
-    map_y = np.clip(raw_map_y, y_min, y_max)
-
-    out_bgr = cv2.remap(
-        painted_bgr,
-        map_x.astype(np.float32),
-        map_y.astype(np.float32),
-        interpolation=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
-    # If shrinking tall hair pulled raw_map_y above the painted frame top, fill cleanly from
-    # source background strictly inside source's active frame (never copying source bars/hair).
-    if top_bar > 0 and float((raw_map_y < y_min).max()) > 0.0:
-        src_probs = segment_multiclass(src_bgr, tflite_path)
-        safe_sky = (
-            (raw_map_y < y_min + 2.0)
-            & (yy >= float(src_top_bar + 2 if src_top_bar > 0 else 0))
-            & (yy < float(src_bot_bar - 2 if src_bot_bar < h else h))
-            & (src_probs[:, :, 1] < 0.25)
-            & (src_probs[:, :, 3] < 0.25)
-        ).astype(np.float32)
-        if float(safe_sky.max()) > 0.0:
-            blend_top = cv2.GaussianBlur(safe_sky, (9, 9), 0)[:, :, None]
-            out_bgr = np.clip(
-                src_bgr.astype(np.float32) * blend_top
-                + out_bgr.astype(np.float32) * (1.0 - blend_top),
-                0.0,
-                255.0,
-            ).astype(np.uint8)
-    if eff_top > 0:
-        bar_src = src_bgr[:eff_top] if src_top_bar >= eff_top else painted_bgr[:eff_top]
-        out_bgr[:eff_top] = bar_src
-    if eff_bot < h:
-        bar_bot = src_bgr[eff_bot:] if src_bot_bar <= eff_bot else painted_bgr[eff_bot:]
-        out_bgr[eff_bot:] = bar_bot
-
+    """Rigidly align BG (no non-rigid pixel warp) and lock non-subject background to source."""
+    del keep_hair
+    aligned_bgr, _ = align_painted_to_source_bg(src_bgr, painted_bgr, tflite_path)
+    out_bgr = lock_background_to_source(src_bgr, aligned_bgr, tflite_path, yunet_path)
     post_report = compare_face_scale(src_bgr, out_bgr, yunet_path, scale_tol=scale_tol)
+    if post_report is None:
+        return out_bgr, None
+
     final_report = ScaleReport(
-        src_face=report.src_face,
-        painted_face=post_report.painted_face if post_report is not None else report.painted_face,
-        iod_ratio=post_report.iod_ratio if post_report is not None else report.iod_ratio,
-        width_ratio=post_report.width_ratio if post_report is not None else report.width_ratio,
-        height_ratio=post_report.height_ratio if post_report is not None else report.height_ratio,
-        scale_ratio=post_report.scale_ratio if post_report is not None else report.scale_ratio,
-        within_tolerance=(
-            post_report.within_tolerance if post_report is not None else report.within_tolerance
-        ),
+        src_face=post_report.src_face,
+        painted_face=post_report.painted_face,
+        iod_ratio=post_report.iod_ratio,
+        width_ratio=post_report.width_ratio,
+        height_ratio=post_report.height_ratio,
+        scale_ratio=post_report.scale_ratio,
+        within_tolerance=post_report.within_tolerance,
         normalized_applied=True,
     )
     return out_bgr, final_report

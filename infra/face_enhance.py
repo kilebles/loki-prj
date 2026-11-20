@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Commercial-safe face restoration (YuNet + GFPGANv1.4/RestoreFormer++ + MediaPipe + Lab)."""
+"""Commercial-safe face restoration (YuNet + Umeyama + GFPGANv1.4/RestoreFormer++ + MediaPipe)."""
 
 from __future__ import annotations
 
@@ -28,6 +28,296 @@ _FFHQ_TEMPLATE_512 = np.array(
     ],
     dtype=np.float32,
 )
+
+
+def _umeyama_similarity_2d(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
+    """Closed-form 2D similarity (no reflection) via Umeyama SVD; immune to LMEDS snaps."""
+    src = np.asarray(src_pts, dtype=np.float64)
+    dst = np.asarray(dst_pts, dtype=np.float64)
+    mu_s = src.mean(axis=0)
+    mu_d = dst.mean(axis=0)
+    sc = src - mu_s
+    dc = dst - mu_d
+    var_s = float(np.sum(sc * sc) / max(len(src), 1))
+    if var_s < 1e-8:
+        return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+
+    cov = (dc.T @ sc) / len(src)
+    u_mat, s_vals, vt_mat = np.linalg.svd(cov)
+    sign_diag = np.ones(2, dtype=np.float64)
+    if np.linalg.det(u_mat) * np.linalg.det(vt_mat) < 0.0:
+        sign_diag[1] = -1.0
+    rot = u_mat @ np.diag(sign_diag) @ vt_mat
+    scale = float(np.sum(s_vals * sign_diag) / var_s)
+    trans = mu_d - scale * (rot @ mu_s)
+
+    mat = np.zeros((2, 3), dtype=np.float32)
+    mat[:, :2] = (scale * rot).astype(np.float32)
+    mat[:, 2] = trans.astype(np.float32)
+    return mat
+
+
+def _affine_to_params(mat: np.ndarray) -> np.ndarray:
+    sc = max(float(np.hypot(mat[0, 0], mat[1, 0])), 1e-6)
+    return np.array(
+        [
+            float(mat[0, 2]),
+            float(mat[1, 2]),
+            float(np.log(sc)),
+            float(mat[0, 0] / sc),
+            float(mat[1, 0] / sc),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _params_to_affine(params: np.ndarray) -> np.ndarray:
+    tx, ty, log_s, cos_t, sin_t = [float(x) for x in params]
+    norm = max(float(np.hypot(cos_t, sin_t)), 1e-6)
+    c, s = cos_t / norm, sin_t / norm
+    sc = float(np.exp(log_s))
+    return np.array(
+        [
+            [sc * c, -sc * s, tx],
+            [sc * s, sc * c, ty],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _gaussian_smooth_1d(arr: np.ndarray, sigma: float = 2.0, radius: int = 5) -> np.ndarray:
+    if len(arr) <= 2:
+        return arr.copy()
+    r = min(radius, len(arr) - 1)
+    offsets = np.arange(-r, r + 1, dtype=np.float64)
+    weights = np.exp(-0.5 * (offsets / sigma) ** 2)
+    weights /= weights.sum()
+    padded = np.pad(arr, [(r, r)] + [(0, 0)] * (arr.ndim - 1), mode="edge")
+    out = np.zeros_like(arr, dtype=np.float64)
+    for idx_w, w in enumerate(weights):
+        out += w * padded[idx_w : idx_w + len(arr)]
+    return out
+
+
+def _smooth_track_landmarks(
+    obs: list[tuple[int, np.ndarray, float]],
+    *,
+    shot_start: int,
+    shot_end: int,
+    max_gap: int = 5,
+    min_len: int = 4,
+    sigma: float = 2.0,
+) -> dict[int, tuple[np.ndarray, np.ndarray, float]]:
+    """Interpolate short gaps, reject outlier snaps, and smooth Umeyama transforms bidir."""
+    if len(obs) < min_len:
+        return {}
+
+    obs_sorted = sorted(obs, key=lambda x: x[0])
+    runs: list[list[tuple[int, np.ndarray, float]]] = [[obs_sorted[0]]]
+    for item in obs_sorted[1:]:
+        if item[0] - runs[-1][-1][0] <= max_gap + 1:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+
+    result: dict[int, tuple[np.ndarray, np.ndarray, float]] = {}
+    for run in runs:
+        if len(run) < min_len:
+            continue
+
+        # Step A: 5-point window-median outlier detection (clean neighbors are never corrupted),
+        # then interpolate flagged landmark glitches linearly from nearest clean frames.
+        obs_arr = np.stack([item[1] for item in run], axis=0).astype(np.float64)
+        obs_frames = np.array([item[0] for item in run], dtype=np.float64)
+        obs_iods = np.linalg.norm(obs_arr[:, 0] - obs_arr[:, 1], axis=1)
+        ref_size = max(float(np.median(obs_iods)) * 2.2, 24.0)
+        m = len(run)
+        is_outlier = np.zeros((m, 5), dtype=bool)
+        if m >= 4:
+            for k in range(m):
+                lo, hi = max(0, k - 2), min(m, k + 3)
+                med = np.median(obs_arr[lo:hi], axis=0)
+                thresh = (0.30 if k in (0, m - 1) else 0.20) * ref_size
+                is_outlier[k] = np.linalg.norm(obs_arr[k] - med, axis=1) > thresh
+        obs_cleaned = obs_arr.copy()
+        for pt_i in range(5):
+            good_idx = np.where(~is_outlier[:, pt_i])[0]
+            if len(good_idx) >= 2 and bool(is_outlier[:, pt_i].any()):
+                bad_idx = np.where(is_outlier[:, pt_i])[0]
+                for dim in range(2):
+                    obs_cleaned[bad_idx, pt_i, dim] = np.interp(
+                        obs_frames[bad_idx],
+                        obs_frames[good_idx],
+                        obs_arr[good_idx, pt_i, dim],
+                    )
+
+        f_start = run[0][0]
+        f_end = run[-1][0]
+        n = f_end - f_start + 1
+        dense_lm = np.zeros((n, 5, 2), dtype=np.float64)
+        dense_area = np.zeros(n, dtype=np.float64)
+
+        for k, (f_idx, _raw_lm, area) in enumerate(run):
+            lm5 = obs_cleaned[k]
+            pos = f_idx - f_start
+            dense_lm[pos] = lm5
+            dense_area[pos] = area
+            if k + 1 < len(run):
+                next_f, _next_raw, next_area = run[k + 1]
+                next_lm = obs_cleaned[k + 1]
+                gap = next_f - f_idx
+                for step in range(1, gap):
+                    alpha = step / float(gap)
+                    dense_lm[pos + step] = (1.0 - alpha) * lm5 + alpha * next_lm
+                    dense_area[pos + step] = (1.0 - alpha) * area + alpha * next_area
+
+        # Step B: bidirectional Gaussian smoothing of landmarks + Umeyama similarity params.
+        smooth_lm = _gaussian_smooth_1d(dense_lm, sigma=sigma, radius=5)
+        raw_params = np.stack(
+            [
+                _affine_to_params(_umeyama_similarity_2d(smooth_lm[k], _FFHQ_TEMPLATE_512))
+                for k in range(n)
+            ],
+            axis=0,
+        )
+        smooth_params = _gaussian_smooth_1d(raw_params, sigma=sigma, radius=5)
+
+        for pos in range(n):
+            f_idx = f_start + pos
+            affine = _params_to_affine(smooth_params[pos])
+            fade_in = 1.0 if f_start <= shot_start + 1 else min(1.0, (pos + 1) / 3.0)
+            fade_out = 1.0 if f_end >= shot_end - 1 else min(1.0, (n - pos) / 3.0)
+            fade = float(min(fade_in, fade_out))
+            result[f_idx] = (smooth_lm[pos].astype(np.float32), affine, fade)
+
+    return result
+
+
+def _collect_smoothed_tracks(
+    input_path: Path,
+    detector: Any,
+    *,
+    score_thresh: float = 0.62,
+) -> tuple[list[dict[int, tuple[float, np.ndarray, np.ndarray, float]]], int]:
+    """Pass 1: detect hard shot cuts & build gap-filled smoothed face trajectories."""
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open input video: {input_path}")
+
+    active: list[dict[str, Any]] = []
+    finished: list[dict[str, Any]] = []
+    shot_start = 0
+    cuts = 0
+    prev_small: np.ndarray | None = None
+    prev_hist: np.ndarray | None = None
+    frame_idx = 0
+
+    try:
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                break
+
+            small = cv2.resize(frame_bgr, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+            hsv = cv2.cvtColor(
+                cv2.resize(frame_bgr, (160, 90), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2HSV
+            )
+            hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+            cv2.normalize(hist, hist)
+            if prev_small is not None and prev_hist is not None:
+                mae = float(np.abs(small - prev_small).mean())
+                corr = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL))
+                if mae > 48.0 or (corr < 0.72 and mae > 20.0):
+                    cuts += 1
+                    for trk in active:
+                        trk["shot_end"] = frame_idx - 1
+                        finished.append(trk)
+                    active = []
+                    shot_start = frame_idx
+            prev_small = small
+            prev_hist = hist
+
+            _, faces = detector.detect(frame_bgr)
+            if faces is not None and len(faces) > 0:
+                candidates = [row for row in faces if float(row[14]) >= score_thresh]
+                candidates.sort(
+                    key=lambda row: float(row[14]) * float(row[2] * row[3]),
+                    reverse=True,
+                )
+                candidates = candidates[:4]
+
+                used_ids: set[int] = set()
+                for row in candidates:
+                    bw, bh = float(row[2]), float(row[3])
+                    area = bw * bh
+                    lm5 = np.array(
+                        [
+                            [row[4], row[5]],
+                            [row[6], row[7]],
+                            [row[8], row[9]],
+                            [row[10], row[11]],
+                            [row[12], row[13]],
+                        ],
+                        dtype=np.float32,
+                    )
+                    max_dist = max(45.0, 0.55 * bw)
+                    best_idx: int | None = None
+                    best_dist = max_dist
+                    for tidx, trk in enumerate(active):
+                        if tidx in used_ids:
+                            continue
+                        if frame_idx - trk["last_f"] > 6:
+                            continue
+                        dist = float(np.mean(np.linalg.norm(lm5 - trk["last_lm"], axis=1)))
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_idx = tidx
+
+                    if best_idx is not None:
+                        active[best_idx]["obs"].append((frame_idx, lm5, area))
+                        active[best_idx]["last_lm"] = lm5
+                        active[best_idx]["last_f"] = frame_idx
+                        active[best_idx]["mean_area"] = (
+                            0.7 * active[best_idx]["mean_area"] + 0.3 * area
+                        )
+                        used_ids.add(best_idx)
+                    else:
+                        active.append(
+                            {
+                                "id": len(finished) + len(active),
+                                "shot_start": shot_start,
+                                "shot_end": frame_idx,
+                                "obs": [(frame_idx, lm5, area)],
+                                "last_lm": lm5,
+                                "last_f": frame_idx,
+                                "mean_area": area,
+                            }
+                        )
+                        used_ids.add(len(active) - 1)
+
+            frame_idx += 1
+    finally:
+        cap.release()
+
+    for trk in active:
+        trk["shot_end"] = frame_idx - 1
+        finished.append(trk)
+
+    per_frame: list[dict[int, tuple[float, np.ndarray, np.ndarray, float]]] = [
+        {} for _ in range(frame_idx)
+    ]
+    for trk in finished:
+        smoothed = _smooth_track_landmarks(
+            trk["obs"],
+            shot_start=int(trk["shot_start"]),
+            shot_end=int(trk["shot_end"]),
+        )
+        tid = int(trk["id"])
+        area = float(trk["mean_area"])
+        for f_idx, (lm5, affine, fade) in smoothed.items():
+            per_frame[f_idx][tid] = (area, lm5, affine, fade)
+
+    return per_frame, cuts
 
 
 def _make_feathered_mask(size: int = 512) -> np.ndarray:
@@ -258,7 +548,7 @@ def enhance_video(
     if use_semantic_mask and seg_model is not None and seg_model.exists():
         from ai_edge_litert.interpreter import Interpreter
 
-        seg_interp = Interpreter(model_path=str(seg_model))
+        seg_interp = Interpreter(model_path=str(seg_model), num_threads=4)
         seg_interp.allocate_tensors()
         semantic_active = True
 
@@ -267,23 +557,49 @@ def enhance_video(
         esr_desc = spandrel.ModelLoader().load_from_file(esrgan_weights)
         esr_model = esr_desc.model.eval().to(device="cuda", dtype=torch.float16)
 
-    cap = cv2.VideoCapture(str(input_path))
-    if not cap.isOpened():
+    probe_cap = cv2.VideoCapture(str(input_path))
+    if not probe_cap.isOpened():
         raise ValueError(f"Could not open input video: {input_path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = probe_cap.get(cv2.CAP_PROP_FPS) or 24.0
+    src_w = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    probe_cap.release()
     out_w, out_h = upscale_to if upscale_to is not None else (src_w, src_h)
 
     detector = cv2.FaceDetectorYN.create(
         model=str(yunet_model),
         config="",
         input_size=(out_w, out_h),
-        score_threshold=0.60,
+        score_threshold=0.58,
         nms_threshold=0.30,
         top_k=5000,
     )
+
+    t0 = time.perf_counter()
+    # Build smoothed 2-pass trajectories (scaling landmarks if Real-ESRGAN upscales frames).
+    if upscale_to is None:
+        per_frame_tracks, cut_count = _collect_smoothed_tracks(input_path, detector)
+    else:
+        # Scale Pass-1 detections from src_w x src_h into out_w x out_h space.
+        detector.setInputSize((src_w, src_h))
+        per_frame_tracks, cut_count = _collect_smoothed_tracks(input_path, detector)
+        sx, sy = out_w / float(src_w), out_h / float(src_h)
+        scaled_tracks: list[dict[int, tuple[float, np.ndarray, np.ndarray, float]]] = []
+        for fmap in per_frame_tracks:
+            s_map: dict[int, tuple[float, np.ndarray, np.ndarray, float]] = {}
+            for tid, (area, lm5, _aff, fade) in fmap.items():
+                lm_scaled = lm5.copy()
+                lm_scaled[:, 0] *= sx
+                lm_scaled[:, 1] *= sy
+                s_map[tid] = (
+                    area * sx * sy,
+                    lm_scaled,
+                    _umeyama_similarity_2d(lm_scaled, _FFHQ_TEMPLATE_512),
+                    fade,
+                )
+            scaled_tracks.append(s_map)
+        per_frame_tracks = scaled_tracks
+
     feather_mask = _make_feathered_mask(512)
     raw_video = out_path.with_name(f"{out_path.stem}_raw.mp4")
 
@@ -318,15 +634,12 @@ def enhance_video(
     )
     assert enc.stdin is not None
 
-    tracks: list[dict[str, Any]] = []
-    ema_alpha = 0.65
-    match_dist_px = 55.0
-    max_missed = 3
+    cap = cv2.VideoCapture(str(input_path))
+    prev_masks: dict[int, np.ndarray] = {}
     faces_detected = 0
     total_face_crops = 0
     frames_done = 0
     first_crop_checked = False
-    t0 = time.perf_counter()
 
     try:
         with torch.inference_mode():
@@ -365,70 +678,21 @@ def enhance_video(
                 else:
                     work_bgr = frame_bgr
 
-                _, faces = detector.detect(work_bgr)
-                if faces is not None and len(faces) > 0:
-                    candidates = [row for row in faces if float(row[14]) >= 0.65]
-                    candidates.sort(
-                        key=lambda row: float(row[14]) * float(row[2] * row[3]),
-                        reverse=True,
-                    )
-                    # Keep up to 4 largest faces; paste smaller background faces first.
-                    selected = list(reversed(candidates[:4]))
-                    used_tracks: set[int] = set()
-                    frame_landmarks: list[np.ndarray] = []
+                fmap = (
+                    per_frame_tracks[frames_done]
+                    if frames_done < len(per_frame_tracks)
+                    else {}
+                )
+                # Drop stale mask EMAs for tracks not in this frame.
+                for stale_tid in [k for k in prev_masks if k not in fmap]:
+                    del prev_masks[stale_tid]
 
-                    for row in selected:
-                        lm5 = np.array(
-                            [
-                                [row[4], row[5]],
-                                [row[6], row[7]],
-                                [row[8], row[9]],
-                                [row[10], row[11]],
-                                [row[12], row[13]],
-                            ],
-                            dtype=np.float32,
-                        )
-                        best_idx: int | None = None
-                        best_dist = match_dist_px
-                        for tidx, trk in enumerate(tracks):
-                            if tidx in used_tracks:
-                                continue
-                            dist = float(np.mean(np.linalg.norm(lm5 - trk["landmarks"], axis=1)))
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_idx = tidx
-
-                        if best_idx is not None:
-                            smoothed = (
-                                ema_alpha * lm5 + (1.0 - ema_alpha) * tracks[best_idx]["landmarks"]
-                            )
-                            tracks[best_idx] = {"landmarks": smoothed, "missed": 0}
-                            used_tracks.add(best_idx)
-                            frame_landmarks.append(smoothed)
-                        else:
-                            tracks.append({"landmarks": lm5, "missed": 0})
-                            used_tracks.add(len(tracks) - 1)
-                            frame_landmarks.append(lm5)
-
-                    surviving: list[dict[str, Any]] = []
-                    for tidx, trk in enumerate(tracks):
-                        if tidx in used_tracks:
-                            surviving.append(trk)
-                        elif trk["missed"] + 1 <= max_missed:
-                            surviving.append(
-                                {
-                                    "landmarks": trk["landmarks"],
-                                    "missed": trk["missed"] + 1,
-                                }
-                            )
-                    tracks = surviving
-
+                if fmap:
+                    # Paste smaller background faces first, primary largest face last.
+                    ordered = sorted(fmap.items(), key=lambda kv: kv[1][0])
                     frame_had_restore = False
-                    for smoothed_lm5 in frame_landmarks:
-                        affine, _ = cv2.estimateAffinePartial2D(
-                            smoothed_lm5, _FFHQ_TEMPLATE_512, method=cv2.LMEDS
-                        )
-                        if affine is None:
+                    for tid, (_area, _lm5, affine, fade) in ordered:
+                        if fade <= 0.0:
                             continue
                         frame_had_restore = True
                         total_face_crops += 1
@@ -455,7 +719,14 @@ def enhance_video(
                             ), f"{restorer} normalization check failed: MAE={mae:.3f}"
                             first_crop_checked = True
 
-                        crop_mask = _make_semantic_mask(crop_bgr, seg_interp, feather_mask)
+                        raw_mask = _make_semantic_mask(crop_bgr, seg_interp, feather_mask)
+                        if tid in prev_masks:
+                            crop_mask = 0.60 * raw_mask + 0.40 * prev_masks[tid]
+                        else:
+                            crop_mask = raw_mask
+                        prev_masks[tid] = crop_mask
+                        eff_mask = crop_mask * float(fade)
+
                         if color_match:
                             restored_bgr = _lab_color_match(
                                 crop_bgr, restored_bgr, crop_mask[:, :, 0]
@@ -481,7 +752,7 @@ def enhance_video(
                             flags=cv2.INTER_LINEAR,
                         )
                         warped_mask = cv2.warpAffine(
-                            crop_mask,
+                            eff_mask,
                             inv_affine,
                             (out_w, out_h),
                             flags=cv2.INTER_LINEAR,
@@ -496,12 +767,6 @@ def enhance_video(
                         ).astype(np.uint8)
                     if frame_had_restore:
                         faces_detected += 1
-                else:
-                    tracks = [
-                        {"landmarks": trk["landmarks"], "missed": trk["missed"] + 1}
-                        for trk in tracks
-                        if trk["missed"] + 1 <= max_missed
-                    ]
 
                 enc.stdin.write(np.ascontiguousarray(work_bgr).tobytes())
                 frames_done += 1
@@ -524,6 +789,7 @@ def enhance_video(
         "semantic_mask": semantic_active,
         "color_match": color_match,
         "grain_strength": grain_strength,
+        "shot_cuts": cut_count,
         "frames": frames_done,
         "faces_detected_frames": faces_detected,
         "face_crops_restored": total_face_crops,
@@ -535,8 +801,8 @@ def enhance_video(
     }
     print(
         f"[face_enhance:{restorer}] {out_path.name}: {frames_done}f "
-        f"(faces={faces_detected}/{frames_done}, sem={semantic_active}, "
-        f"lab={color_match}, grain={grain_strength}), "
+        f"(faces={faces_detected}/{frames_done}, cuts={cut_count}, "
+        f"sem={semantic_active}, lab={color_match}, grain={grain_strength}), "
         f"{infer_sec:.2f}s, peak={peak_vram_gib:.2f} GiB",
         flush=True,
     )
@@ -548,7 +814,7 @@ def enhance_video(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="GFPGAN v1.4 / RestoreFormer++ + MediaPipe + YuNet + Real-ESRGAN."
+        description="GFPGAN v1.4 / RestoreFormer++ + MediaPipe + YuNet + Umeyama post-processor."
     )
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--audio-source", type=Path, required=True)

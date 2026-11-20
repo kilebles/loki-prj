@@ -17,9 +17,11 @@ from PIL import Image, ImageOps
 
 from loki_remake.face_qc import (
     ScaleReport,
+    align_painted_to_source_bg,
     compare_face_scale,
+    detect_letterbox_bars,
     ensure_local_aux_models,
-    normalize_head_scale,
+    lock_background_to_source,
 )
 from loki_remake.gpuniq.client import GPUniqAPIError, GPUniqClient
 from loki_remake.schemas import PaintedRef, RemakeMode
@@ -52,8 +54,15 @@ def _build_paint_prompt(
     has_user_ref: bool,
     *,
     keep_hair: bool = False,
+    has_letterbox: bool = False,
     scale_feedback: str | None = None,
 ) -> str:
+    letterbox_clause = (
+        " Keep the exact top and bottom black letterbox bars untouched—do NOT crop, zoom, or "
+        "reframe the image."
+        if has_letterbox
+        else ""
+    )
     if mode == "swap":
         if has_user_ref:
             hair_clause = (
@@ -76,7 +85,7 @@ def _build_paint_prompt(
                 f"first image rather than copying the expression or smile from the reference "
                 f"portrait. Naturally match the scene lighting direction, shadows, color "
                 f"temperature, and camera grain of the first image while keeping clothing, hands, "
-                f"objects, and background unchanged."
+                f"objects, and background unchanged.{letterbox_clause}"
             )
             if scale_feedback:
                 prompt += f" CRITICAL CORRECTION: {scale_feedback}"
@@ -85,6 +94,7 @@ def _build_paint_prompt(
             f"Edit the first image according to this instruction: {instruction}. "
             f"Keep the exact same camera angle, framing, head proportions, pose, lighting, "
             f"background, and every unchanged person or object identical to the first image."
+            f"{letterbox_clause}"
         )
 
     if has_user_ref:
@@ -247,7 +257,7 @@ def paint_keyframe(
     custom_prompt: str | None = None,
     keep_hair: bool = False,
     normalize_scale: bool = True,
-    scale_tol: float = 0.07,
+    scale_tol: float = 0.09,
     max_scale_retries: int = 1,
     aux_models_dir: Path | None = None,
     model: str = "nano-banana-2",
@@ -264,10 +274,22 @@ def paint_keyframe(
     elif user_ref is not None:
         refs.append(user_ref)
 
+    src_bgr = cv2.imread(str(source_frame))
+    has_letterbox = False
+    if src_bgr is not None:
+        src_top, src_bot = detect_letterbox_bars(src_bgr)
+        has_letterbox = src_top > 12 or src_bot < src_bgr.shape[0] - 12
+
     prompt = (
         custom_prompt
         if custom_prompt is not None
-        else _build_paint_prompt(mode, instruction, has_user_ref=bool(refs), keep_hair=keep_hair)
+        else _build_paint_prompt(
+            mode,
+            instruction,
+            has_user_ref=bool(refs),
+            keep_hair=keep_hair,
+            has_letterbox=has_letterbox,
+        )
     )
     input_images = [encode_image_data_url(source_frame)]
     for ref_path in refs:
@@ -304,16 +326,20 @@ def paint_keyframe(
     scale_ratio_final: float | None = None
     scale_normalized = False
 
-    if normalize_scale and mode == "swap" and refs and custom_prompt is None:
+    if (
+        normalize_scale
+        and mode == "swap"
+        and refs
+        and custom_prompt is None
+        and src_bgr is not None
+    ):
         aux = _load_qc_models(aux_models_dir)
         if aux is not None:
             yunet_path, tflite_path = aux
-            src_bgr = cv2.imread(str(source_frame))
-            img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            report: ScaleReport | None = (
-                compare_face_scale(src_bgr, img_bgr, yunet_path, scale_tol=scale_tol)
-                if src_bgr is not None
-                else None
+            raw_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            aligned_bgr, zoom_undo = align_painted_to_source_bg(src_bgr, raw_bgr, tflite_path)
+            report: ScaleReport | None = compare_face_scale(
+                src_bgr, aligned_bgr, yunet_path, scale_tol=scale_tol
             )
             if report is not None:
                 scale_ratio_raw = report.scale_ratio
@@ -321,8 +347,8 @@ def paint_keyframe(
                 if not report.within_tolerance and max_scale_retries > 0:
                     delta_pct = abs(report.scale_ratio - 1.0) * 100.0
                     logger.warning(
-                        "Keyframe pin_frame={} face scale_ratio={:.3f} (exceeds +/-{:.0%}); "
-                        "retrying paint with stricter scale lock",
+                        "Keyframe pin_frame={} aligned face scale_ratio={:.3f} (exceeds "
+                        "+/-{:.0%}); retrying paint with stricter scale lock",
                         pin_frame,
                         report.scale_ratio,
                         scale_tol,
@@ -336,13 +362,14 @@ def paint_keyframe(
                     else:
                         feedback = (
                             f"The previous output shrank the head by {delta_pct:.0f}%. Match the "
-                            f"exact skull size and eye-to-eye distance of the first image 1:1."
+                            "exact skull size and eye-to-eye distance of the first image 1:1."
                         )
                     retry_prompt = _build_paint_prompt(
                         mode,
                         instruction,
                         has_user_ref=True,
                         keep_hair=keep_hair,
+                        has_letterbox=has_letterbox,
                         scale_feedback=feedback,
                     )
                     try:
@@ -358,15 +385,19 @@ def paint_keyframe(
                         )
                         total_cost += float(r_data.get("cost_usd") or 0.0)
                         r_img = _fit_decoded_image(r_data, target_size)
-                        r_bgr = cv2.cvtColor(np.array(r_img), cv2.COLOR_RGB2BGR)
+                        r_raw_bgr = cv2.cvtColor(np.array(r_img), cv2.COLOR_RGB2BGR)
+                        r_aligned_bgr, r_zoom = align_painted_to_source_bg(
+                            src_bgr, r_raw_bgr, tflite_path
+                        )
                         r_report = compare_face_scale(
-                            src_bgr, r_bgr, yunet_path, scale_tol=scale_tol
+                            src_bgr, r_aligned_bgr, yunet_path, scale_tol=scale_tol
                         )
                         if r_report is not None and abs(r_report.scale_ratio - 1.0) < abs(
                             report.scale_ratio - 1.0
                         ):
                             img = r_img
-                            img_bgr = r_bgr
+                            aligned_bgr = r_aligned_bgr
+                            zoom_undo = r_zoom
                             report = r_report
                             job_id = r_job_id
                             model_used = r_model
@@ -380,29 +411,27 @@ def paint_keyframe(
                     except Exception as exc:
                         logger.warning("Scale-lock retry failed, keeping initial paint: {}", exc)
 
-                if not report.within_tolerance:
+                if abs(zoom_undo - 1.0) > 0.01 or not report.within_tolerance:
                     raw_path = out_path.with_name(f"{out_path.stem}_raw.png")
                     raw_path.parent.mkdir(parents=True, exist_ok=True)
                     img.save(raw_path, format="PNG")
-                    norm_bgr, post_report = normalize_head_scale(
-                        src_bgr,
-                        img_bgr,
-                        yunet_path=yunet_path,
-                        tflite_path=tflite_path,
-                        keep_hair=keep_hair,
-                        scale_tol=scale_tol,
-                    )
-                    img = Image.fromarray(cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2RGB))
-                    scale_normalized = True
-                    if post_report is not None:
-                        scale_ratio_final = post_report.scale_ratio
-                    logger.info(
-                        "Normalized pin_frame={} head scale {:.3f} -> {} (raw saved to {})",
-                        pin_frame,
-                        scale_ratio_raw,
-                        scale_ratio_final,
-                        raw_path.name,
-                    )
+
+                locked_bgr = lock_background_to_source(
+                    src_bgr, aligned_bgr, tflite_path, yunet_path
+                )
+                img = Image.fromarray(cv2.cvtColor(locked_bgr, cv2.COLOR_BGR2RGB))
+                post_report = compare_face_scale(
+                    src_bgr, locked_bgr, yunet_path, scale_tol=scale_tol
+                )
+                scale_normalized = True
+                if post_report is not None:
+                    scale_ratio_final = post_report.scale_ratio
+                logger.info(
+                    "Locked BG on pin_frame={} (zoom_undo={:.3f}, scale={})",
+                    pin_frame,
+                    zoom_undo,
+                    scale_ratio_final,
+                )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, format="PNG")
