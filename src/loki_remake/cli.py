@@ -268,6 +268,14 @@ def gpu_up(
         else:
             candidates = [pick_best_h200(client, min_disk_gb=min_disk)]
 
+        existing_data = client.list_instances(page=1, page_size=50)
+        existing_ids = {
+            int(row_id)
+            for inst in existing_data.get("instances", [])
+            if inst.get("status") not in ("failed", "deleted", "terminated")
+            and (row_id := inst.get("id") or inst.get("task_id")) is not None
+        }
+
         order: dict[str, object] | None = None
         selected_offer: dict[str, object] | None = None
         last_err: Exception | None = None
@@ -292,6 +300,24 @@ def gpu_up(
                 break
             except GPUniqAPIError as exc:
                 last_err = exc
+                # Recover if order succeeded on server before client hit ReadTimeout.
+                current_data = client.list_instances(page=1, page_size=50)
+                new_alive = [
+                    inst
+                    for inst in current_data.get("instances", [])
+                    if inst.get("status") not in ("failed", "deleted", "terminated")
+                    and (row_id := inst.get("id") or inst.get("task_id")) is not None
+                    and int(row_id) not in existing_ids
+                ]
+                if new_alive:
+                    recovered_id = int(new_alive[0].get("id") or new_alive[0].get("task_id"))
+                    console.print(
+                        f"[yellow]Recovered provisioned task_id={recovered_id} "
+                        f"after order error ({exc})[/yellow]"
+                    )
+                    order = {"order_id": recovered_id, "estimated_cost": price_hr}
+                    selected_offer = offer
+                    break
                 console.print(f"[yellow]Offer agent_id={selected_id} skipped: {exc}[/yellow]")
                 continue
 

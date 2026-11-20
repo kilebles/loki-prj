@@ -493,3 +493,21 @@ def test_run_ssh_idle_timeout(monkeypatch, tmp_path: Path) -> None:
             stream=True,
             idle_timeout=0.3,
         )
+
+
+def test_create_marketplace_order_never_retries_on_timeout(httpx_mock: HTTPXMock) -> None:
+    import httpx
+    import pytest
+
+    from loki_remake.gpuniq.client import GPUniqAPIError
+
+    httpx_mock.add_exception(
+        httpx.ReadTimeout("timed out"),
+        method="POST",
+        url="https://api.gpuniq.com/v1/marketplace/order",
+    )
+    with GPUniqClient(api_key="gpuniq_test") as client:
+        with pytest.raises(GPUniqAPIError, match="Transport error"):
+            client.create_marketplace_order(agent_id=123)
+
+    assert len(httpx_mock.get_requests()) == 1

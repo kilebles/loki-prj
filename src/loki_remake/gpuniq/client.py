@@ -69,9 +69,11 @@ class GPUniqClient:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
+        retry_on_error: bool = True,
     ) -> dict[str, Any]:
         last_exc: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
+        max_attempts = self.max_retries if retry_on_error else 1
+        for attempt in range(1, max_attempts + 1):
             try:
                 resp = self._client.request(
                     method,
@@ -82,7 +84,7 @@ class GPUniqClient:
                 )
             except httpx.TransportError as exc:
                 last_exc = exc
-                if attempt < self.max_retries:
+                if attempt < max_attempts:
                     delay = 1.5 * attempt
                     logger.warning(
                         "Transport error on {} {} ({}), retrying in {}s", method, path, exc, delay
@@ -91,7 +93,7 @@ class GPUniqClient:
                     continue
                 raise GPUniqAPIError(f"Transport error on {method} {path}: {exc}") from exc
 
-            if resp.status_code in _RETRYABLE_STATUS and attempt < self.max_retries:
+            if resp.status_code in _RETRYABLE_STATUS and attempt < max_attempts:
                 retry_after = resp.headers.get("Retry-After")
                 is_digits = bool(retry_after and retry_after.isdigit())
                 delay = float(retry_after) if is_digits else 1.5 * attempt
@@ -247,7 +249,13 @@ class GPUniqClient:
             body["ssh_key_ids"] = ssh_key_ids
         if volume_id is not None:
             body["volume_id"] = volume_id
-        return self._request("POST", "/v1/marketplace/order", json=body, timeout=120.0)["data"]
+        return self._request(
+            "POST",
+            "/v1/marketplace/order",
+            json=body,
+            timeout=300.0,
+            retry_on_error=False,
+        )["data"]
 
     def list_volumes(self) -> list[dict[str, Any]]:
         return self._request("GET", "/v1/volumes/")["data"]
@@ -281,7 +289,13 @@ class GPUniqClient:
         }
         if volume_id is not None:
             body["volume_id"] = volume_id
-        return self._request("POST", "/v1/gpu-cloud/deploy", json=body)["data"]
+        return self._request(
+            "POST",
+            "/v1/gpu-cloud/deploy",
+            json=body,
+            timeout=300.0,
+            retry_on_error=False,
+        )["data"]
 
     def start_instance(self, task_id: int) -> dict[str, Any]:
         return self._request("POST", f"/v1/instances/{task_id}/start")["data"]
