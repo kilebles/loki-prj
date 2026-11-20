@@ -48,6 +48,9 @@ class ScaleReport:
     scale_ratio: float
     within_tolerance: bool
     normalized_applied: bool = False
+    chin_drop_ratio: float = 0.0
+    eye_offset_ratio: float = 0.0
+    geom_error: float = 0.0
 
 
 def _download_if_missing(url: str, dest: Path) -> Path:
@@ -156,9 +159,11 @@ def compare_face_scale(
     painted_bgr: np.ndarray,
     yunet_path: Path,
     *,
-    scale_tol: float = 0.07,
+    scale_tol: float = 0.06,
+    chin_drop_tol: float = 0.08,
+    eye_offset_tol: float = 0.09,
 ) -> ScaleReport | None:
-    """Measure how much the painted primary face expanded/shrank relative to source."""
+    """Measure scale, IOD, chin drop, and eye shift between source and repainted faces."""
     src_faces = detect_faces_yunet(src_bgr, yunet_path)
     painted_faces = detect_faces_yunet(painted_bgr, yunet_path)
     if not src_faces or not painted_faces:
@@ -177,6 +182,26 @@ def compare_face_scale(
     height_ratio = painted_face.bbox[3] / max(src_face.bbox[3], 1e-3)
     scale_ratio = float(np.median([iod_ratio, width_ratio, height_ratio]))
 
+    src_h = max(src_face.bbox[3], 1e-3)
+    src_chin_y = src_face.bbox[1] + src_face.bbox[3]
+    painted_chin_y = painted_face.bbox[1] + painted_face.bbox[3]
+    chin_drop_ratio = (painted_chin_y - src_chin_y) / src_h
+    painted_ec = np.array(painted_face.eye_center, dtype=np.float32)
+    eye_offset_ratio = float(np.linalg.norm(painted_ec - src_ec)) / src_h
+    geom_error = (
+        abs(scale_ratio - 1.0)
+        + 0.5 * abs(iod_ratio - 1.0)
+        + 0.8 * max(0.0, chin_drop_ratio)
+        + 0.35 * abs(chin_drop_ratio)
+        + 0.5 * eye_offset_ratio
+    )
+    within_tol = (
+        abs(scale_ratio - 1.0) <= scale_tol
+        and abs(iod_ratio - 1.0) <= scale_tol + 0.03
+        and chin_drop_ratio <= chin_drop_tol
+        and eye_offset_ratio <= eye_offset_tol
+    )
+
     return ScaleReport(
         src_face=src_face,
         painted_face=painted_face,
@@ -184,8 +209,11 @@ def compare_face_scale(
         width_ratio=round(width_ratio, 4),
         height_ratio=round(height_ratio, 4),
         scale_ratio=round(scale_ratio, 4),
-        within_tolerance=abs(scale_ratio - 1.0) <= scale_tol,
+        within_tolerance=within_tol,
         normalized_applied=False,
+        chin_drop_ratio=round(chin_drop_ratio, 4),
+        eye_offset_ratio=round(eye_offset_ratio, 4),
+        geom_error=round(geom_error, 4),
     )
 
 
@@ -360,15 +388,15 @@ def lock_background_to_source(
     hair_alpha = np.clip(cv2.GaussianBlur(head_dil, (blur_k, blur_k), 0), 0.0, 1.0)
 
     yy = np.arange(h, dtype=np.float32)[:, None]
-    below_nose = np.clip((yy - (fy + fh * 0.55)) / max(fh * 0.15, 6.0), 0.0, 1.0)
+    below_mouth = np.clip((yy - (fy + fh * 0.72)) / max(fh * 0.14, 5.0), 0.0, 1.0)
     clothes_bin = (src_probs[:, :, 4] > 0.30).astype(np.uint8)
-    clothes_dil = cv2.dilate(clothes_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    clothes_dil = cv2.dilate(clothes_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     clothes_sharp = cv2.GaussianBlur(
         np.maximum(np.clip(src_probs[:, :, 4] * 1.3, 0.0, 1.0), clothes_dil.astype(np.float32)),
-        (5, 5),
+        (3, 3),
         0,
     )
-    alpha = np.clip(hair_alpha * (1.0 - clothes_sharp * below_nose), 0.0, 1.0)[:, :, None]
+    alpha = np.clip(hair_alpha * (1.0 - clothes_sharp * below_mouth), 0.0, 1.0)[:, :, None]
 
     out_bgr = np.clip(
         aligned_painted_bgr.astype(np.float32) * alpha
@@ -386,7 +414,7 @@ def normalize_head_scale(
     yunet_path: Path,
     tflite_path: Path,
     keep_hair: bool = False,
-    scale_tol: float = 0.09,
+    scale_tol: float = 0.06,
 ) -> tuple[np.ndarray, ScaleReport | None]:
     """Rigidly align BG (no non-rigid pixel warp) and lock non-subject background to source."""
     del keep_hair
@@ -405,5 +433,8 @@ def normalize_head_scale(
         scale_ratio=post_report.scale_ratio,
         within_tolerance=post_report.within_tolerance,
         normalized_applied=True,
+        chin_drop_ratio=post_report.chin_drop_ratio,
+        eye_offset_ratio=post_report.eye_offset_ratio,
+        geom_error=post_report.geom_error,
     )
     return out_bgr, final_report

@@ -14,6 +14,7 @@ from loki_remake.schemas import ShotInfo
 _MIN_SHOT_FRAMES = 12
 _HIST_CORR_CUT_THRESHOLD = 0.55
 _LUMA_JUMP_THRESHOLD = 28.0
+_LUMA_CUT_THRESHOLD = 45.0
 
 
 def format_timestamp(frame_idx: int, fps: float = 24.0) -> str:
@@ -72,6 +73,7 @@ def _detect_cut_indices(frames: list[np.ndarray]) -> list[int]:
 
         if idx - last_cut >= _MIN_SHOT_FRAMES and (
             corr < _HIST_CORR_CUT_THRESHOLD
+            or luma_diff > _LUMA_CUT_THRESHOLD
             or (corr < 0.75 and luma_diff > _LUMA_JUMP_THRESHOLD)
         ):
             cuts.append(idx)

@@ -57,42 +57,17 @@ def _umeyama_similarity_2d(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarr
     return mat
 
 
-def _affine_to_params(mat: np.ndarray) -> np.ndarray:
-    sc = max(float(np.hypot(mat[0, 0], mat[1, 0])), 1e-6)
-    return np.array(
-        [
-            float(mat[0, 2]),
-            float(mat[1, 2]),
-            float(np.log(sc)),
-            float(mat[0, 0] / sc),
-            float(mat[1, 0] / sc),
-        ],
-        dtype=np.float64,
-    )
-
-
-def _params_to_affine(params: np.ndarray) -> np.ndarray:
-    tx, ty, log_s, cos_t, sin_t = [float(x) for x in params]
-    norm = max(float(np.hypot(cos_t, sin_t)), 1e-6)
-    c, s = cos_t / norm, sin_t / norm
-    sc = float(np.exp(log_s))
-    return np.array(
-        [
-            [sc * c, -sc * s, tx],
-            [sc * s, sc * c, ty],
-        ],
-        dtype=np.float32,
-    )
-
-
-def _gaussian_smooth_1d(arr: np.ndarray, sigma: float = 2.0, radius: int = 5) -> np.ndarray:
-    if len(arr) <= 2:
+def _gaussian_smooth_1d(arr: np.ndarray, sigma: float = 1.0, radius: int = 3) -> np.ndarray:
+    """Bidirectional Gaussian smoother with velocity-preserving endpoint reflection."""
+    if len(arr) <= 2 or sigma <= 0.0 or radius <= 0:
         return arr.copy()
     r = min(radius, len(arr) - 1)
     offsets = np.arange(-r, r + 1, dtype=np.float64)
     weights = np.exp(-0.5 * (offsets / sigma) ** 2)
     weights /= weights.sum()
-    padded = np.pad(arr, [(r, r)] + [(0, 0)] * (arr.ndim - 1), mode="edge")
+    left = np.stack([2.0 * arr[0] - arr[k] for k in range(r, 0, -1)], axis=0)
+    right = np.stack([2.0 * arr[-1] - arr[-1 - k] for k in range(1, r + 1)], axis=0)
+    padded = np.concatenate([left, arr, right], axis=0)
     out = np.zeros_like(arr, dtype=np.float64)
     for idx_w, w in enumerate(weights):
         out += w * padded[idx_w : idx_w + len(arr)]
@@ -106,9 +81,10 @@ def _smooth_track_landmarks(
     shot_end: int,
     max_gap: int = 5,
     min_len: int = 4,
-    sigma: float = 2.0,
+    min_iod: float = 16.0,
+    sigma: float = 1.0,
 ) -> dict[int, tuple[np.ndarray, np.ndarray, float]]:
-    """Interpolate short gaps, reject outlier snaps, and smooth Umeyama transforms bidir."""
+    """Interpolate short gaps, reject outlier snaps, and smooth landmarks with lag clamping."""
     if len(obs) < min_len:
         return {}
 
@@ -125,20 +101,32 @@ def _smooth_track_landmarks(
         if len(run) < min_len:
             continue
 
-        # Step A: 5-point window-median outlier detection (clean neighbors are never corrupted),
-        # then interpolate flagged landmark glitches linearly from nearest clean frames.
+        # Step A: interior monotonic-aware chord outlier rejection (preserves fast linear pans
+        # and endpoint velocity while catching single-frame detector snaps).
         obs_arr = np.stack([item[1] for item in run], axis=0).astype(np.float64)
         obs_frames = np.array([item[0] for item in run], dtype=np.float64)
         obs_iods = np.linalg.norm(obs_arr[:, 0] - obs_arr[:, 1], axis=1)
-        ref_size = max(float(np.median(obs_iods)) * 2.2, 24.0)
+        med_iod = float(np.median(obs_iods))
+        if med_iod < min_iod:
+            continue
+        ref_size = max(med_iod * 2.2, 24.0)
         m = len(run)
         is_outlier = np.zeros((m, 5), dtype=bool)
-        if m >= 4:
-            for k in range(m):
-                lo, hi = max(0, k - 2), min(m, k + 3)
-                med = np.median(obs_arr[lo:hi], axis=0)
-                thresh = (0.30 if k in (0, m - 1) else 0.20) * ref_size
-                is_outlier[k] = np.linalg.norm(obs_arr[k] - med, axis=1) > thresh
+        if m >= 3:
+            thresh = 0.22 * ref_size
+            chord_err = np.zeros((m, 5), dtype=np.float64)
+            rev_dir = np.zeros((m, 5), dtype=bool)
+            for k in range(1, m - 1):
+                dt_tot = max(obs_frames[k + 1] - obs_frames[k - 1], 1.0)
+                alpha = (obs_frames[k] - obs_frames[k - 1]) / dt_tot
+                pred = (1.0 - alpha) * obs_arr[k - 1] + alpha * obs_arr[k + 1]
+                v_prev = obs_arr[k] - obs_arr[k - 1]
+                v_next = obs_arr[k + 1] - obs_arr[k]
+                rev_dir[k] = np.sum(v_prev * v_next, axis=1) < 0.0
+                chord_err[k] = np.linalg.norm(obs_arr[k] - pred, axis=1)
+            for k in range(1, m - 1):
+                is_peak = (chord_err[k] >= chord_err[k - 1]) & (chord_err[k] >= chord_err[k + 1])
+                is_outlier[k] = rev_dir[k] & (chord_err[k] > thresh) & is_peak
         obs_cleaned = obs_arr.copy()
         for pt_i in range(5):
             good_idx = np.where(~is_outlier[:, pt_i])[0]
@@ -155,40 +143,35 @@ def _smooth_track_landmarks(
         f_end = run[-1][0]
         n = f_end - f_start + 1
         dense_lm = np.zeros((n, 5, 2), dtype=np.float64)
-        dense_area = np.zeros(n, dtype=np.float64)
 
-        for k, (f_idx, _raw_lm, area) in enumerate(run):
+        for k, (f_idx, _raw_lm, _area) in enumerate(run):
             lm5 = obs_cleaned[k]
             pos = f_idx - f_start
             dense_lm[pos] = lm5
-            dense_area[pos] = area
             if k + 1 < len(run):
-                next_f, _next_raw, next_area = run[k + 1]
+                next_f, _next_raw, _next_area = run[k + 1]
                 next_lm = obs_cleaned[k + 1]
                 gap = next_f - f_idx
                 for step in range(1, gap):
                     alpha = step / float(gap)
                     dense_lm[pos + step] = (1.0 - alpha) * lm5 + alpha * next_lm
-                    dense_area[pos + step] = (1.0 - alpha) * area + alpha * next_area
 
-        # Step B: bidirectional Gaussian smoothing of landmarks + Umeyama similarity params.
-        smooth_lm = _gaussian_smooth_1d(dense_lm, sigma=sigma, radius=5)
-        raw_params = np.stack(
-            [
-                _affine_to_params(_umeyama_similarity_2d(smooth_lm[k], _FFHQ_TEMPLATE_512))
-                for k in range(n)
-            ],
-            axis=0,
-        )
-        smooth_params = _gaussian_smooth_1d(raw_params, sigma=sigma, radius=5)
+        # Step B: single-pass light smoothing + deviation clamp so fast head turns never lag.
+        smooth_lm = _gaussian_smooth_1d(dense_lm, sigma=sigma, radius=3)
+        local_iod = np.linalg.norm(dense_lm[:, 0] - dense_lm[:, 1], axis=1)
+        max_dev = np.maximum(1.8, 0.032 * local_iod)[:, None, None]
+        delta = smooth_lm - dense_lm
+        d_norm = np.linalg.norm(delta, axis=2, keepdims=True)
+        scale = np.where(d_norm > max_dev, max_dev / np.maximum(d_norm, 1e-6), 1.0)
+        clamped_lm = dense_lm + delta * scale
 
         for pos in range(n):
             f_idx = f_start + pos
-            affine = _params_to_affine(smooth_params[pos])
+            affine = _umeyama_similarity_2d(clamped_lm[pos], _FFHQ_TEMPLATE_512)
             fade_in = 1.0 if f_start <= shot_start + 1 else min(1.0, (pos + 1) / 3.0)
             fade_out = 1.0 if f_end >= shot_end - 1 else min(1.0, (n - pos) / 3.0)
             fade = float(min(fade_in, fade_out))
-            result[f_idx] = (smooth_lm[pos].astype(np.float32), affine, fade)
+            result[f_idx] = (clamped_lm[pos].astype(np.float32), affine, fade)
 
     return result
 
@@ -260,7 +243,7 @@ def _collect_smoothed_tracks(
                         ],
                         dtype=np.float32,
                     )
-                    max_dist = max(45.0, 0.55 * bw)
+                    max_dist = max(65.0, 0.95 * bw)
                     best_idx: int | None = None
                     best_dist = max_dist
                     for tidx, trk in enumerate(active):
@@ -320,6 +303,50 @@ def _collect_smoothed_tracks(
     return per_frame, cuts
 
 
+def _detect_letterbox_bars(bgr: np.ndarray, threshold: float = 10.0) -> tuple[int, int]:
+    """Detect contiguous black letterbox row bounds (top_bar, bot_bar) on a single frame."""
+    h = bgr.shape[0]
+    means = bgr.mean(axis=(1, 2))
+    top = 0
+    while top < h // 3 and float(means[top]) < threshold:
+        top += 1
+    bot = h
+    while bot > (2 * h) // 3 and float(means[bot - 1]) < threshold:
+        bot -= 1
+    return top, bot
+
+
+def _detect_video_letterbox_bars(input_path: Path, threshold: float = 10.0) -> tuple[int, int]:
+    """Detect persistent black letterbox bars across sampled frames of a video."""
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        return 0, 0
+    try:
+        n_frames = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0), 1)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if h <= 0:
+            return 0, 0
+        sample_indices = sorted(
+            {round(i * (n_frames - 1) / 11.0) for i in range(min(12, n_frames))}
+        )
+        top_min, bot_max = h // 3, (2 * h) // 3
+        saw_frame = False
+        for f_idx in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(f_idx))
+            ok, fr = cap.read()
+            if not ok or fr is None:
+                continue
+            saw_frame = True
+            t_b, b_b = _detect_letterbox_bars(fr, threshold=threshold)
+            top_min = min(top_min, t_b)
+            bot_max = max(bot_max, b_b)
+        if not saw_frame:
+            return 0, h
+        return top_min, bot_max
+    finally:
+        cap.release()
+
+
 def _make_feathered_mask(size: int = 512) -> np.ndarray:
     """Create a soft elliptical alpha mask inside 512x512 so pasted face has zero seam."""
     mask = np.zeros((size, size), dtype=np.float32)
@@ -331,14 +358,14 @@ def _make_feathered_mask(size: int = 512) -> np.ndarray:
     return mask[:, :, None]
 
 
-def _make_semantic_mask(
+def _make_semantic_parts(
     crop_bgr: np.ndarray,
     seg_interp: Any | None,
     fallback_mask: np.ndarray,
-) -> np.ndarray:
-    """Occlusion-aware MediaPipe face mask (keeps hands, glasses, clothes, exterior hair)."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (face_soft_3d, crisp_occ_keep_3d) so face EMA never smears moving collars."""
     if seg_interp is None:
-        return fallback_mask
+        return fallback_mask, np.ones_like(fallback_mask)
 
     h, w = crop_bgr.shape[:2]
     in_det = seg_interp.get_input_details()[0]
@@ -369,6 +396,11 @@ def _make_semantic_mask(
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     face_closed = cv2.morphologyEx(probs[:, :, 3], cv2.MORPH_CLOSE, kernel)
 
+    # Never fall back to full oval on non-face false positives (shoulders, letterbox edges).
+    if float(face_closed.mean()) < 0.04 or float(face_closed.max()) < 0.35:
+        zeros = np.zeros_like(fallback_mask)
+        return zeros, zeros
+
     # Protect upper eyebrows gently without pulling stray exterior hair/bangs.
     inner_core = np.zeros((h, w), dtype=np.float32)
     cv2.ellipse(
@@ -383,14 +415,30 @@ def _make_semantic_mask(
     )
     hair_brow = np.clip(probs[:, :, 1] * inner_core * 0.65, 0.0, 1.0)
 
-    occluder = np.clip(probs[:, :, 0] + probs[:, :, 4] + probs[:, :, 5], 0.0, 1.0)
-    sem = np.clip((face_closed + hair_brow) * (1.0 - occluder), 0.0, 1.0)
-    sem = sem * fallback_mask[:, :, 0]
-    sem = np.clip(cv2.GaussianBlur(sem, (21, 21), sigmaX=6, sigmaY=6), 0.0, 1.0)
+    face_raw = np.clip(face_closed + hair_brow, 0.0, 1.0) * fallback_mask[:, :, 0]
+    face_soft = np.clip(cv2.GaussianBlur(face_raw, (15, 15), sigmaX=4.0, sigmaY=4.0), 0.0, 1.0)
 
-    if float(sem.mean()) < 0.05:
-        return fallback_mask
-    return sem[:, :, None]
+    clothes_bin = (probs[:, :, 4] > 0.28).astype(np.uint8)
+    clothes_dil = cv2.dilate(
+        clothes_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    ).astype(np.float32)
+    occ = np.clip(
+        np.maximum(probs[:, :, 4] * 1.25, clothes_dil) + probs[:, :, 0] + probs[:, :, 5],
+        0.0,
+        1.0,
+    )
+    occ_keep = np.clip(1.0 - cv2.GaussianBlur(occ, (5, 5), sigmaX=1.5, sigmaY=1.5), 0.0, 1.0)
+    return face_soft[:, :, None], occ_keep[:, :, None]
+
+
+def _make_semantic_mask(
+    crop_bgr: np.ndarray,
+    seg_interp: Any | None,
+    fallback_mask: np.ndarray,
+) -> np.ndarray:
+    """Occlusion-aware MediaPipe face mask (keeps hands, glasses, clothes, exterior hair)."""
+    face_soft, occ_keep = _make_semantic_parts(crop_bgr, seg_interp, fallback_mask)
+    return np.clip(face_soft * occ_keep, 0.0, 1.0)
 
 
 def _lab_color_match(
@@ -610,6 +658,14 @@ def enhance_video(
             scaled_tracks.append(s_map)
         per_frame_tracks = scaled_tracks
 
+    top_src, bot_src = _detect_video_letterbox_bars(input_path)
+    if upscale_to is not None and src_h > 0:
+        sy_bar = out_h / float(src_h)
+        top_bar = int(round(top_src * sy_bar))
+        bot_bar = int(round(bot_src * sy_bar))
+    else:
+        top_bar, bot_bar = top_src, bot_src
+
     feather_mask = _make_feathered_mask(512)
     raw_video = out_path.with_name(f"{out_path.stem}_raw.mp4")
 
@@ -704,8 +760,6 @@ def enhance_video(
                     for tid, (_area, _lm5, affine, fade) in ordered:
                         if fade <= 0.0:
                             continue
-                        frame_had_restore = True
-                        total_face_crops += 1
                         crop_bgr = cv2.warpAffine(
                             work_bgr,
                             affine,
@@ -713,6 +767,15 @@ def enhance_video(
                             flags=cv2.INTER_CUBIC,
                             borderMode=cv2.BORDER_REFLECT_101,
                         )
+                        face_soft, occ_keep = _make_semantic_parts(
+                            crop_bgr, seg_interp, feather_mask
+                        )
+                        if float(face_soft.max()) < 0.02:
+                            prev_masks.pop(tid, None)
+                            continue
+
+                        frame_had_restore = True
+                        total_face_crops += 1
                         restored_bgr = _restore_face(face_model, crop_bgr, restorer)
 
                         if not first_crop_checked:
@@ -729,12 +792,12 @@ def enhance_video(
                             ), f"{restorer} normalization check failed: MAE={mae:.3f}"
                             first_crop_checked = True
 
-                        raw_mask = _make_semantic_mask(crop_bgr, seg_interp, feather_mask)
                         if tid in prev_masks:
-                            crop_mask = 0.60 * raw_mask + 0.40 * prev_masks[tid]
+                            ema_face = 0.75 * face_soft + 0.25 * prev_masks[tid]
                         else:
-                            crop_mask = raw_mask
-                        prev_masks[tid] = crop_mask
+                            ema_face = face_soft
+                        prev_masks[tid] = ema_face
+                        crop_mask = np.clip(ema_face * occ_keep, 0.0, 1.0)
                         eff_mask = crop_mask * float(fade)
 
                         if color_match:
@@ -769,6 +832,10 @@ def enhance_video(
                         )
                         if warped_mask.ndim == 2:
                             warped_mask = warped_mask[:, :, None]
+                        if top_bar > 0:
+                            warped_mask[:top_bar] = 0.0
+                        if bot_bar < out_h:
+                            warped_mask[bot_bar:] = 0.0
                         work_bgr = np.clip(
                             warped_face * warped_mask
                             + work_bgr.astype(np.float32) * (1.0 - warped_mask),

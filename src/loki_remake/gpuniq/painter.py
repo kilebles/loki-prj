@@ -79,13 +79,16 @@ def _build_paint_prompt(
                 f"likeness shown in the second reference portrait. Instruction: {instruction}. "
                 f"{hair_clause} "
                 f"CRITICAL PROPORTIONS AND EXPRESSION: Keep the exact same skull size, head width "
-                f"and height, eye-to-eye distance, neck length, head tilt, and head-to-shoulder "
-                f"ratio as the first image—never enlarge the head. Preserve the exact facial "
-                f"expression, mouth openness or closedness, eye gaze direction, and emotion of the "
-                f"first image rather than copying the expression or smile from the reference "
-                f"portrait. Naturally match the scene lighting direction, shadows, color "
-                f"temperature, and camera grain of the first image while keeping clothing, hands, "
-                f"objects, and background unchanged.{letterbox_clause}"
+                f"and height, eye-to-eye distance, visible neck length, chin vertical position, "
+                f"head tilt, and head-to-shoulder ratio as the first image—never enlarge the head "
+                f"or sink the chin downward into any jacket collar or clothing; preserve the clean "
+                f"separation between jawline/neck and raised collar edges. Match the exact head "
+                f"yaw and profile rotation angle (including sharp 3/4 left or right turns), eye "
+                f"gaze direction, and neutral/relaxed mouth openness or emotion of the first image "
+                f"rather than pasting a frontal smile from the reference portrait. Naturally match "
+                f"the scene lighting direction, shadows, color temperature, and camera grain of "
+                f"the first image while keeping clothing, hands, objects, and background "
+                f"unchanged.{letterbox_clause}"
             )
             if scale_feedback:
                 prompt += f" CRITICAL CORRECTION: {scale_feedback}"
@@ -240,6 +243,60 @@ def _load_qc_models(aux_models_dir: Path | None) -> tuple[Path, Path] | None:
         return None
 
 
+def _report_error(report: ScaleReport) -> float:
+    return report.geom_error if report.geom_error > 0.0 else abs(report.scale_ratio - 1.0)
+
+
+def _build_scale_feedback(report: ScaleReport, scale_tol: float) -> str:
+    parts: list[str] = []
+    if abs(report.scale_ratio - 1.0) > scale_tol:
+        delta_pct = abs(report.scale_ratio - 1.0) * 100.0
+        if report.scale_ratio > 1.0:
+            parts.append(
+                f"The previous output enlarged the head by {delta_pct:.0f}% "
+                "(too large, bobblehead proportion). Shrink the skull and hair volume "
+                "so the face box matches the first image 1:1."
+            )
+        else:
+            parts.append(
+                f"The previous output shrank the head by {delta_pct:.0f}%. Match the "
+                "exact skull size and face box of the first image 1:1."
+            )
+    if abs(report.iod_ratio - 1.0) > scale_tol + 0.03:
+        iod_pct = abs(report.iod_ratio - 1.0) * 100.0
+        if report.iod_ratio > 1.0:
+            parts.append(
+                f"Inter-eye distance widened by {iod_pct:.0f}% (face became too wide/frontal). "
+                "Match the exact head yaw angle and foreshortened eye-to-eye spacing of the "
+                "first image 1:1."
+            )
+        else:
+            parts.append(
+                f"Inter-eye distance narrowed by {iod_pct:.0f}%. Match the exact eye-to-eye "
+                "spacing 1:1."
+            )
+    if report.chin_drop_ratio > 0.08:
+        chin_pct = report.chin_drop_ratio * 100.0
+        parts.append(
+            f"The previous output shifted the head downward by {chin_pct:.0f}% so the chin sank "
+            "into the collar and hid the neck. Raise the head to match the exact eye height, chin "
+            "height, and visible neck gap above the collar of the first image 1:1."
+        )
+    if report.eye_offset_ratio > 0.09:
+        eye_pct = report.eye_offset_ratio * 100.0
+        parts.append(
+            f"The previous output shifted eye placement by {eye_pct:.0f}%. Anchor both eyes "
+            "directly onto the first image's eye coordinates 1:1."
+        )
+    if not parts:
+        delta_pct = abs(report.scale_ratio - 1.0) * 100.0
+        parts.append(
+            f"The previous output deviated in head scale ({delta_pct:.0f}%). Match the "
+            "exact skull size, chin height, and eye-to-eye distance of the first image 1:1."
+        )
+    return " ".join(parts)
+
+
 def paint_keyframe(
     client: GPUniqClient,
     source_frame: Path,
@@ -257,8 +314,8 @@ def paint_keyframe(
     custom_prompt: str | None = None,
     keep_hair: bool = False,
     normalize_scale: bool = True,
-    scale_tol: float = 0.09,
-    max_scale_retries: int = 1,
+    scale_tol: float = 0.06,
+    max_scale_retries: int = 2,
     aux_models_dir: Path | None = None,
     model: str = "nano-banana-2",
     fallback_model: str | None = "gpt-image-2",
@@ -344,26 +401,22 @@ def paint_keyframe(
             if report is not None:
                 scale_ratio_raw = report.scale_ratio
                 scale_ratio_final = report.scale_ratio
-                if not report.within_tolerance and max_scale_retries > 0:
-                    delta_pct = abs(report.scale_ratio - 1.0) * 100.0
+                for retry_idx in range(max_scale_retries):
+                    if report.within_tolerance:
+                        break
                     logger.warning(
-                        "Keyframe pin_frame={} aligned face scale_ratio={:.3f} (exceeds "
-                        "+/-{:.0%}); retrying paint with stricter scale lock",
+                        "Keyframe pin_frame={} retry {}/{} aligned geom QC failed "
+                        "(scale={:.3f}, iod={:.3f}, chin_drop={:+.3f}, eye_off={:.3f}, err={:.3f})",
                         pin_frame,
+                        retry_idx + 1,
+                        max_scale_retries,
                         report.scale_ratio,
-                        scale_tol,
+                        report.iod_ratio,
+                        report.chin_drop_ratio,
+                        report.eye_offset_ratio,
+                        _report_error(report),
                     )
-                    if report.scale_ratio > 1.0:
-                        feedback = (
-                            f"The previous output enlarged the head by {delta_pct:.0f}% "
-                            "(too large, bobblehead proportion). Shrink the skull and hair volume "
-                            "so the face box and eye-to-eye distance match the first image 1:1."
-                        )
-                    else:
-                        feedback = (
-                            f"The previous output shrank the head by {delta_pct:.0f}%. Match the "
-                            "exact skull size and eye-to-eye distance of the first image 1:1."
-                        )
+                    feedback = _build_scale_feedback(report, scale_tol)
                     retry_prompt = _build_paint_prompt(
                         mode,
                         instruction,
@@ -392,9 +445,7 @@ def paint_keyframe(
                         r_report = compare_face_scale(
                             src_bgr, r_aligned_bgr, yunet_path, scale_tol=scale_tol
                         )
-                        if r_report is not None and abs(r_report.scale_ratio - 1.0) < abs(
-                            report.scale_ratio - 1.0
-                        ):
+                        if r_report is not None and _report_error(r_report) < _report_error(report):
                             img = r_img
                             aligned_bgr = r_aligned_bgr
                             zoom_undo = r_zoom
@@ -403,13 +454,20 @@ def paint_keyframe(
                             model_used = r_model
                             scale_ratio_final = r_report.scale_ratio
                             logger.info(
-                                "Retry improved pin_frame={} scale_ratio {:.3f} -> {:.3f}",
+                                "Retry {} improved pin_frame={} geom_error -> {:.3f} "
+                                "(scale={:.3f}, chin_drop={:+.3f})",
+                                retry_idx + 1,
                                 pin_frame,
-                                scale_ratio_raw,
+                                _report_error(r_report),
                                 scale_ratio_final,
+                                r_report.chin_drop_ratio,
                             )
                     except Exception as exc:
-                        logger.warning("Scale-lock retry failed, keeping initial paint: {}", exc)
+                        logger.warning(
+                            "Scale-lock retry {} failed, keeping current best: {}",
+                            retry_idx + 1,
+                            exc,
+                        )
 
                 if abs(zoom_undo - 1.0) > 0.01 or not report.within_tolerance:
                     raw_path = out_path.with_name(f"{out_path.stem}_raw.png")

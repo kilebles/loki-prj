@@ -233,6 +233,165 @@ def test_face_enhance_umeyama_and_track_smoothing() -> None:
     assert abs(float(smoothed[5][0][0, 0] - (_FFHQ_TEMPLATE_512[0, 0] * 0.5 + 5.0))) < 5.0
 
 
+def test_compare_face_scale_rejects_chin_drop(monkeypatch, tmp_path: Path) -> None:
+    img_a = np.zeros((240, 320, 3), dtype=np.uint8)
+    img_b = np.full((240, 320, 3), 10, dtype=np.uint8)
+    src_face = _make_face(160.0, 100.0, 80.0, 100.0, 40.0)
+    # Identical size/IOD (scale_ratio == 1.0), but chin shifted downward by +15px (15% > 8%).
+    dropped_face = face_qc.FaceMeasurement(
+        bbox=(120.0, 75.0, 80.0, 100.0),
+        lm5=src_face.lm5 + np.array([[0.0, 15.0]], dtype=np.float32),
+        iod=40.0,
+        eye_center=(160.0, 115.0),
+        score=0.98,
+    )
+
+    monkeypatch.setattr(
+        face_qc,
+        "detect_faces_yunet",
+        lambda img, _p, score_threshold=0.5: [src_face] if img is img_a else [dropped_face],
+    )
+    report = face_qc.compare_face_scale(img_a, img_b, tmp_path / "y.onnx")
+    assert report is not None
+    assert report.scale_ratio == 1.0
+    assert report.chin_drop_ratio == 0.15
+    assert report.within_tolerance is False
+    assert report.geom_error > 0.1
+
+
+def test_painter_chin_drop_feedback_and_best_geom_selection(
+    httpx_mock: HTTPXMock, monkeypatch, tmp_path: Path
+) -> None:
+    src_frame = tmp_path / "src.png"
+    user_ref = tmp_path / "ref.png"
+    out_path = tmp_path / "painted.png"
+    Image.new("RGB", (64, 64), (100, 110, 120)).save(src_frame)
+    Image.new("RGB", (64, 64), (20, 180, 90)).save(user_ref)
+
+    b64_img = _b64_png((320, 240), (80, 90, 100))
+    for jid in ("j1", "j2"):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.gpuniq.com/v1/llm/images/jobs",
+            json={"exception": 0, "data": {"job_id": jid, "status": "queued"}},
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url=f"https://api.gpuniq.com/v1/llm/images/jobs/{jid}",
+            json={
+                "exception": 0,
+                "data": {
+                    "job_id": jid,
+                    "status": "completed",
+                    "cost_usd": 0.04,
+                    "image": {"b64_json": b64_img},
+                },
+            },
+        )
+
+    sf = _make_face(160.0, 100.0, 80.0, 100.0, 40.0)
+    rep_bad = face_qc.ScaleReport(
+        sf, sf, 1.0, 1.0, 1.0, 1.0, within_tolerance=False, chin_drop_ratio=0.18, geom_error=0.25
+    )
+    rep_good = face_qc.ScaleReport(
+        sf, sf, 1.01, 1.0, 1.0, 1.0, within_tolerance=True, chin_drop_ratio=0.01, geom_error=0.02
+    )
+    calls = {"n": 0}
+
+    def fake_cmp(*_a, **_kw):
+        calls["n"] += 1
+        return rep_bad if calls["n"] == 1 else rep_good
+
+    monkeypatch.setattr(
+        painter, "_load_qc_models", lambda _d: (tmp_path / "y.onnx", tmp_path / "s.tflite")
+    )
+    monkeypatch.setattr(painter, "align_painted_to_source_bg", lambda _s, p, _t: (p, 1.0))
+    monkeypatch.setattr(painter, "compare_face_scale", fake_cmp)
+    monkeypatch.setattr(painter, "lock_background_to_source", lambda _s, a, _t, _y: a)
+
+    with GPUniqClient(api_key="gpuniq_test") as client:
+        painted = painter.paint_keyframe(
+            client,
+            source_frame=src_frame,
+            mode="swap",
+            instruction="Swap face",
+            aspect_ratio="16:9",
+            target_size=(320, 240),
+            out_path=out_path,
+            user_ref=user_ref,
+            normalize_scale=True,
+            max_scale_retries=2,
+            sleep_fn=lambda _: None,
+        )
+
+    reqs = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+    # Stopped after retry 1 because rep_good had within_tolerance=True (only 2 total calls).
+    assert len(reqs) == 2
+    retry_payload = json.loads(reqs[1].content.decode("utf-8"))
+    assert "chin sank" in retry_payload["prompt"]
+    assert painted.cost_usd == 0.08
+
+
+def test_face_enhance_fast_pan_zero_lag_and_semantic_collar_parts() -> None:
+    infra_dir = str(Path(__file__).resolve().parents[1] / "infra")
+    if infra_dir not in sys.path:
+        sys.path.insert(0, infra_dir)
+    from face_enhance import _FFHQ_TEMPLATE_512, _make_semantic_parts, _smooth_track_landmarks
+
+    # Rapidly accelerating pan (+1.5 * f^2 px): endpoint reflection & deviation clamp prevent lag.
+    obs = []
+    for f in range(12):
+        shift = 1.5 * (f**2)
+        pts = _FFHQ_TEMPLATE_512 * 0.5 + np.array([shift, 0.0], dtype=np.float32)
+        if f == 6:
+            pts[2, 0] += 90.0  # synthetic detector glitch on nose
+        obs.append((f, pts, 4000.0))
+
+    smoothed = _smooth_track_landmarks(obs, shot_start=0, shot_end=11, max_gap=5, min_len=4)
+    assert len(smoothed) == 12
+    for f in range(12):
+        true_pts = _FFHQ_TEMPLATE_512 * 0.5 + np.array([1.5 * (f**2), 0.0], dtype=np.float32)
+        lag = float(np.max(np.linalg.norm(smoothed[f][0] - true_pts, axis=1)))
+        limit = 4.0 if f == 6 else 2.5
+        assert lag < limit, f"frame {f} lag={lag:.2f}px exceeds {limit}px"
+
+    # Fake MediaPipe interpreter: case 1 = no face pixels (shoulder/BG), case 2 = face + collar.
+    class _FakeInterp:
+        def __init__(self, probs: np.ndarray) -> None:
+            self._probs = probs
+
+        def get_input_details(self):
+            return [{"index": 0, "shape": np.array([1, 32, 32, 3]), "dtype": np.float32}]
+
+        def get_output_details(self):
+            return [{"index": 1}]
+
+        def set_tensor(self, _idx, _arr):
+            pass
+
+        def invoke(self):
+            pass
+
+        def get_tensor(self, _idx):
+            return self._probs[None, ...]
+
+    dummy_crop = np.zeros((128, 128, 3), dtype=np.uint8)
+    fallback = np.ones((128, 128, 1), dtype=np.float32)
+
+    no_face_probs = np.zeros((32, 32, 6), dtype=np.float32)
+    no_face_probs[:, :, 4] = 1.0
+    face_soft_0, occ_keep_0 = _make_semantic_parts(dummy_crop, _FakeInterp(no_face_probs), fallback)
+    assert float(face_soft_0.max()) == 0.0
+    assert float(occ_keep_0.max()) == 0.0
+
+    collar_probs = np.zeros((32, 32, 6), dtype=np.float32)
+    collar_probs[:20, :, 3] = 1.0  # upper face skin
+    collar_probs[20:, :, 4] = 1.0  # lower popped collar clothes
+    face_soft_1, occ_keep_1 = _make_semantic_parts(dummy_crop, _FakeInterp(collar_probs), fallback)
+    assert float(face_soft_1[32, 64, 0]) > 0.8
+    assert float(occ_keep_1[110, 64, 0]) < 0.05
+
+
 def test_cli_help_includes_new_flags() -> None:
     runner = CliRunner()
     env = {"COLUMNS": "140"}
