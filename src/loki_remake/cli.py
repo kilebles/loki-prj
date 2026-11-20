@@ -14,6 +14,12 @@ from rich.table import Table
 
 from loki_remake.config import get_settings
 from loki_remake.engine.viggle_bf16 import run_remote_render
+from loki_remake.engine.worker_client import (
+    get_remote_worker_status,
+    render_via_remote_worker,
+    start_remote_worker,
+    stop_remote_worker,
+)
 from loki_remake.gpuniq.client import GPUniqAPIError, GPUniqClient
 from loki_remake.gpuniq.ops import (
     clear_active_gpu,
@@ -463,6 +469,92 @@ def gpu_render(
         f"peak VRAM={res.peak_alloc_gib:.1f}/{res.peak_reserved_gib:.1f} GiB | "
         f"cost=${res.render_cost_usd:.4f} (infer=${res.inference_only_cost_usd:.4f})"
     )
+
+
+@app.command("gpu-worker-start")
+def gpu_worker_start(
+    mode: Annotated[str, typer.Option(help="LoRA mode to preload: swap, edit, or none")] = "swap",
+    quant: Annotated[str, typer.Option(help="Quantization: fp8, int8, or bf16")] = "fp8",
+    port: Annotated[int, typer.Option(help="Worker HTTP port on remote localhost")] = 8000,
+    wait: Annotated[bool, typer.Option(help="Wait until models are warm and ready")] = True,
+) -> None:
+    """Start the resident GPU worker daemon on the active GPU (loads models once into VRAM)."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    state = _require_active_gpu()
+    console.print(
+        f"Starting resident GPU worker on {state.gpu_model} "
+        f"(mode={mode}, quant={quant}, port={port})..."
+    )
+    info = start_remote_worker(state, mode=mode, quant=quant, port=port, wait_ready=wait)
+    console.print(f"[green]Resident GPU worker {info.get('status')}:[/green] {json.dumps(info)}")
+
+
+@app.command("gpu-worker-status")
+def gpu_worker_status(
+    port: Annotated[int, typer.Option(help="Worker HTTP port on remote localhost")] = 8000,
+) -> None:
+    """Check health, VRAM usage, and completed job count of the resident GPU worker."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    state = _require_active_gpu()
+    info = get_remote_worker_status(state, port=port)
+    console.print_json(json.dumps(info))
+
+
+@app.command("gpu-worker-render")
+def gpu_worker_render(
+    job_dir: Annotated[Path, typer.Option(exists=True, file_okay=False, help="Prepared job dir")],
+    tier: Annotated[RenderTier | None, typer.Option(help="Override short edge: 480 or 736")] = None,
+    seed: Annotated[int, typer.Option(help="Random seed")] = 0,
+    restorer: Annotated[
+        str, typer.Option(help="Optional inline face restorer: none, gfpgan, or restoreformer")
+    ] = "none",
+    fidelity: Annotated[float, typer.Option(help="Face restorer blend weight (0..1)")] = 0.65,
+    grain_strength: Annotated[float, typer.Option(help="Luminance film-grain reinjection")] = 0.35,
+    upscale_to: Annotated[
+        str | None, typer.Option(help="Optional Real-ESRGAN target WxH (e.g. 1280x736)")
+    ] = None,
+    port: Annotated[int, typer.Option(help="Worker HTTP port on remote localhost")] = 8000,
+) -> None:
+    """Render a prepared job via the warm resident GPU worker (zero ~315s cold start)."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    state = _require_active_gpu()
+
+    res = render_via_remote_worker(
+        state,
+        job_dir,
+        short_edge=tier,
+        seed=seed,
+        restorer=restorer,
+        fidelity=fidelity,
+        grain_strength=grain_strength,
+        upscale_to=upscale_to,
+        port=port,
+    )
+    console.print(f"[green]Rendered via warm worker:[/green] {res['local_out']}")
+    if res.get("local_enhanced_out"):
+        console.print(f"[green]Enhanced ({restorer}):[/green] {res['local_enhanced_out']}")
+    console.print(
+        f"Geometry: {res['width']}x{res['height']}x{res['num_frames']} | "
+        f"encode={res['text_encode_sec']}s, render={res['render_sec']}s, "
+        f"enhance={res['enhance_sec']}s, total={res['total_sec']}s | "
+        f"peak VRAM={res['peak_alloc_gib']}/{res['peak_reserved_gib']} GiB | "
+        f"cost=${res['gpu_cost_usd']:.4f} | jobs={res['jobs_completed']}"
+    )
+
+
+@app.command("gpu-worker-stop")
+def gpu_worker_stop(
+    port: Annotated[int, typer.Option(help="Worker HTTP port on remote localhost")] = 8000,
+) -> None:
+    """Gracefully stop the resident GPU worker daemon on the active GPU."""
+    settings = get_settings()
+    _configure_logging(settings.log_level)
+    state = _require_active_gpu()
+    res = stop_remote_worker(state, port=port)
+    console.print(f"[yellow]Worker shutdown requested:[/yellow] {res}")
 
 
 @app.command("gpu-stop")

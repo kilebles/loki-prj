@@ -70,7 +70,7 @@ RUN mkdir -p /opt/loki-models/face /opt/loki-models/realesrgan && \
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
 
 COPY infra/sample_fp8.py infra/face_enhance.py infra/restoreformer_arch.py \
-     infra/bootstrap_models.sh infra/entrypoint.sh /opt/loki-app/
+     infra/gpu_worker.py infra/bootstrap_models.sh infra/entrypoint.sh /opt/loki-app/
 
 RUN chmod +x /opt/loki-app/bootstrap_models.sh /opt/loki-app/entrypoint.sh && \
     printf '%s\n' \
@@ -88,6 +88,6 @@ RUN chmod +x /opt/loki-app/bootstrap_models.sh /opt/loki-app/entrypoint.sh && \
         'HF_HUB_ENABLE_HF_TRANSFER=1' \
         >> /etc/environment
 
-EXPOSE 22
+EXPOSE 22 8000
 WORKDIR /workspace
 ENTRYPOINT ["/opt/loki-app/entrypoint.sh"]

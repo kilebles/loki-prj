@@ -38,4 +38,20 @@ if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
   ssh-keygen -A
 fi
 
+# Production resident worker mode: bootstrap base models if absent, keep sshd optional in background,
+# and exec the resident GPU HTTP worker so models stay warm in VRAM across requests.
+if [ "${LOKI_WORKER_MODE:-0}" = "1" ]; then
+  if [ -n "${PUB_KEY}" ]; then
+    /usr/sbin/sshd -e &
+  fi
+  if [ ! -f "${LOKI_MODELS_DIR:-/workspace/models}/MiniMax-H3/modular_model_index.json" ]; then
+    /opt/loki-app/bootstrap_models.sh
+  fi
+  exec /opt/loki-venv/bin/python /opt/loki-app/gpu_worker.py \
+    --host "${LOKI_WORKER_HOST:-0.0.0.0}" \
+    --port "${LOKI_WORKER_PORT:-8000}" \
+    --preload-mode "${LOKI_PRELOAD_MODE:-swap}" \
+    --quant "${LOKI_QUANT:-fp8}"
+fi
+
 exec /usr/sbin/sshd -D -e

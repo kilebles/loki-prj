@@ -525,6 +525,10 @@ def enhance_video(
     esrgan_weights: Path,
     fidelity: float,
     stats_out: Path | None,
+    preloaded_face_model: Any | None = None,
+    preloaded_esr_model: Any | None = None,
+    preloaded_seg_interp: Any | None = None,
+    preloaded_detector: Any | None = None,
 ) -> dict[str, Any]:
     import spandrel
     import torch
@@ -532,7 +536,9 @@ def enhance_video(
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    if restorer == "restoreformer":
+    if preloaded_face_model is not None:
+        face_model = preloaded_face_model
+    elif restorer == "restoreformer":
         infra_dir = str(Path(__file__).resolve().parent)
         if infra_dir not in sys.path:
             sys.path.insert(0, infra_dir)
@@ -543,17 +549,17 @@ def enhance_video(
         gfp_desc = spandrel.ModelLoader().load_from_file(gfpgan_weights)
         face_model = gfp_desc.model.eval().to(device="cuda", dtype=torch.float32)
 
-    seg_interp = None
-    semantic_active = False
-    if use_semantic_mask and seg_model is not None and seg_model.exists():
+    seg_interp = preloaded_seg_interp
+    semantic_active = seg_interp is not None
+    if not semantic_active and use_semantic_mask and seg_model is not None and seg_model.exists():
         from ai_edge_litert.interpreter import Interpreter
 
         seg_interp = Interpreter(model_path=str(seg_model), num_threads=4)
         seg_interp.allocate_tensors()
         semantic_active = True
 
-    esr_model = None
-    if upscale_to is not None:
+    esr_model = preloaded_esr_model
+    if upscale_to is not None and esr_model is None:
         esr_desc = spandrel.ModelLoader().load_from_file(esrgan_weights)
         esr_model = esr_desc.model.eval().to(device="cuda", dtype=torch.float16)
 
@@ -566,14 +572,18 @@ def enhance_video(
     probe_cap.release()
     out_w, out_h = upscale_to if upscale_to is not None else (src_w, src_h)
 
-    detector = cv2.FaceDetectorYN.create(
-        model=str(yunet_model),
-        config="",
-        input_size=(out_w, out_h),
-        score_threshold=0.58,
-        nms_threshold=0.30,
-        top_k=5000,
-    )
+    if preloaded_detector is not None:
+        detector = preloaded_detector
+        detector.setInputSize((out_w, out_h))
+    else:
+        detector = cv2.FaceDetectorYN.create(
+            model=str(yunet_model),
+            config="",
+            input_size=(out_w, out_h),
+            score_threshold=0.58,
+            nms_threshold=0.30,
+            top_k=5000,
+        )
 
     t0 = time.perf_counter()
     # Build smoothed 2-pass trajectories (scaling landmarks if Real-ESRGAN upscales frames).
