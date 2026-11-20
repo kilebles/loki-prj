@@ -5,6 +5,7 @@ description = "LOKI Remake video-to-video pipeline on MiniMax-H3 / Viggle-Remake
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ai-edge-litert>=2.0",
     "httpx>=0.28",
     "loguru>=0.7",
     "numpy>=1.26",

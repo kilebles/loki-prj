@@ -60,6 +60,9 @@ class PaintedRef(BaseModel):
     model_used: str
     cost_usd: float = 0.0
     job_id: str = ""
+    scale_ratio_raw: float | None = None
+    scale_ratio_final: float | None = None
+    scale_normalized: bool = False
 
 
 class PromptValidationResult(BaseModel):

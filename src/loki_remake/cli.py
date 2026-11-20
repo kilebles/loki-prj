@@ -130,6 +130,16 @@ def prepare(
     paint_model: Annotated[
         str | None, typer.Option(help="Override painter image model slug")
     ] = None,
+    keep_hair: Annotated[
+        bool, typer.Option("--keep-hair/--swap-hair", help="Keep original subject hair outline")
+    ] = False,
+    normalize_scale: Annotated[
+        bool,
+        typer.Option(
+            "--normalize-scale/--no-normalize-scale",
+            help="Enforce keyframe head proportion lock via retry + geometric remap",
+        ),
+    ] = True,
     out: Annotated[Path | None, typer.Option(help="Output job directory")] = None,
 ) -> None:
     """Normalize video, extract shots/keyframes, paint refs, and build MiniMax-H3 prompt."""
@@ -146,6 +156,8 @@ def prepare(
         max_refs=max_refs,
         out_dir=out,
         paint_model=paint_model,
+        keep_hair=keep_hair,
+        normalize_scale=normalize_scale,
     )
 
     console.print(f"[green]Prepared job {job.job_id}[/green]")
@@ -246,6 +258,9 @@ def gpu_up(
         bool, typer.Option(help="Auto-select best fast 1x RTX PRO 6000 96GB offer")
     ] = False,
     disk: Annotated[int, typer.Option(help="Container disk size in GB")] = 250,
+    image: Annotated[
+        str | None, typer.Option(help="Override container Docker image (e.g. ghcr.io/...)")
+    ] = None,
 ) -> None:
     """Rent a 1x GPU on GPUniq Marketplace with minute billing and wait for SSH."""
     settings = get_settings()
@@ -292,7 +307,7 @@ def gpu_up(
                     agent_id=selected_id,
                     gpu_required=1,
                     pricing_type="minute",
-                    docker_image="vastai/pytorch:cuda-12.9.1-auto",
+                    docker_image=image or settings.gpu_docker_image,
                     ssh_key_ids=[ssh_key_id],
                     disk_gb=disk,
                 )
@@ -593,7 +608,7 @@ def gpu_upscale_bench(
                     agent_id=selected_id,
                     gpu_required=1,
                     pricing_type="minute",
-                    docker_image="vastai/pytorch:cuda-12.9.1-auto",
+                    docker_image=settings.gpu_docker_image,
                     ssh_key_ids=[ssh_key_id],
                     disk_gb=disk,
                 )

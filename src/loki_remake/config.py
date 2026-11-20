@@ -25,6 +25,7 @@ class Settings(BaseSettings):
         default_factory=lambda: ["seedream-4-5", "flux-2-pro", "gpt-image-2"]
     )
     vlm_model: str = "gemini-3-flash"
+    gpu_docker_image: str = "vastai/pytorch:cuda-12.9.1-auto"
     default_tier: Literal[480, 736] = 480
     work_dir: Path = Path("work")
     log_level: Literal[

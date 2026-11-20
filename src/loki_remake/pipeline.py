@@ -28,6 +28,8 @@ def prepare_job(
     max_refs: int = 2,
     out_dir: Path | None = None,
     paint_model: str | None = None,
+    keep_hair: bool = False,
+    normalize_scale: bool = True,
     client: GPUniqClient | None = None,
 ) -> PreparedJob:
     """Run normalize -> shot detection -> keyframe painting -> 6-section prompt generation."""
@@ -76,6 +78,8 @@ def prepare_job(
                 pin_frame=pin_frame,
                 fps=float(normalized.fps),
                 user_ref=user_ref_path,
+                keep_hair=keep_hair,
+                normalize_scale=normalize_scale,
                 model=paint_model or settings.painter_model,
                 fallback_model=settings.painter_fallback_model,
                 fallback_models=settings.painter_fallback_models,
